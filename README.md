@@ -2,7 +2,7 @@
 
 A lightweight, keyboard-driven Plex client for the terminal, built for [Omarchy](https://omarchy.org).
 
-Browse your libraries as a tree — **library → show → season → episode** or **library → movie** — and play with `mpv`. Plexi picks up your current Omarchy theme colors and follows along live when you switch themes.
+Browse your libraries as a tree — **library → show → season → episode** or **library → movie** — with **Continue Watching** and **Recently Added** at the top, and play with `mpv`. Plexi picks up your current Omarchy theme colors and follows along live when you switch themes.
 
 ```
 ╭─ plexi living-room ──────────────────────────────────────────────────────────────────────────╮
@@ -22,6 +22,7 @@ Browse your libraries as a tree — **library → show → season → episode** 
 
 - Zero dependencies beyond Python 3.11+ and `mpv`
 - Signs in through plex.tv in your browser, finds your server, prefers local connections
+- Continue Watching (in progress and up next) and Recently Added across all libraries
 - Resumes where you left off and reports progress back to Plex (watched at 90%)
 - Unwatched `●` / in-progress `◐` markers, detail pane with summary and media info
 - Incremental search across everything you've loaded

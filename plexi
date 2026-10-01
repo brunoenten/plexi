@@ -23,7 +23,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PRODUCT = "plexi"
 
 XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
@@ -238,6 +238,18 @@ class Plex:
         dirs = self.get("/library/sections").get("Directory", [])
         return [d for d in dirs if d.get("type") in ("movie", "show")]
 
+    def continue_watching(self):
+        try:
+            items = self.get("/hubs/continueWatching/items").get("Metadata", [])
+        except PlexError:
+            items = self.get("/library/onDeck").get("Metadata", [])
+        return [i for i in items if i.get("type") in PLAYABLE]
+
+    def recently_added(self, limit=50):
+        paging = {"X-Plex-Container-Start": 0, "X-Plex-Container-Size": limit}
+        items = self.get("/library/recentlyAdded", **paging).get("Metadata", [])
+        return [i for i in items if i.get("type") in BROWSABLE][:limit]
+
     def items(self, section_key):
         return self.get(f"/library/sections/{section_key}/all").get("Metadata", [])
 
@@ -357,7 +369,14 @@ def login(theme):
 # ── tree ─────────────────────────────────────────────────────────────────
 
 LEAVES = ("movie", "episode")
-SECTION_ICONS = {"movie": "\uf008", "show": "\uf26c"}
+PLAYABLE = LEAVES
+BROWSABLE = ("movie", "show", "season", "episode")
+SECTION_ICONS = {"movie": "\uf008", "show": "\uf26c", "continue": "\uf144", "recent": "\uf017"}
+HUBS = [
+    {"key": "hub:continue", "hub": "continue", "title": "Continue Watching", "summary": "in progress and up next"},
+    {"key": "hub:recent", "hub": "recent", "title": "Recently Added", "summary": "newest across all libraries"},
+]
+CONTAINERS = ("root", "hub", "section")
 
 
 class Node:
@@ -391,13 +410,18 @@ class Node:
 
     def label(self):
         d = self.data
+        in_hub = self.parent is not None and self.parent.kind == "hub"
+        if in_hub and self.kind == "episode":
+            return f"{d.get('grandparentTitle', '')} · S{d.get('parentIndex', 0):02d}E{d.get('index', 0):02d} · {d.get('title', '')}"
+        if in_hub and self.kind == "season":
+            return f"{d.get('parentTitle', '')} · {d.get('title', '')}"
         if self.kind == "episode" and "index" in d:
             return f"{d['index']:>2}  {d.get('title', '')}"
         return d.get("title", "")
 
     def meta(self):
         d = self.data
-        if self.kind == "section":
+        if self.kind in ("section", "hub"):
             return str(len(self.children)) if self.children is not None else ""
         if self.kind == "show":
             parts = [str(d["year"])] if d.get("year") else []
@@ -636,7 +660,9 @@ class App:
 
     def fetch(self, node):
         if node.kind == "root":
-            return self.plex.sections()
+            return HUBS + self.plex.sections()
+        if node.kind == "hub":
+            return self.plex.continue_watching() if node.data["hub"] == "continue" else self.plex.recently_added()
         if node.kind == "section":
             return self.plex.items(node.data["key"])
         return self.plex.children(node.key)
@@ -658,7 +684,13 @@ class App:
             if child:
                 child.data = data
             else:
-                child = Node(data, "section" if node.kind == "root" else data.get("type"), node)
+                if "hub" in data:
+                    kind = "hub"
+                elif node.kind == "root":
+                    kind = "section"
+                else:
+                    kind = data.get("type")
+                child = Node(data, kind, node)
             children.append(child)
         node.children = children
         self.flash("" if children else "nothing here", "light_foreground")
@@ -675,7 +707,7 @@ class App:
     def refresh_meta(self, node):
         try:
             n = node
-            while n and n.kind not in ("root", "section"):
+            while n and n.kind not in CONTAINERS:
                 n.data = self.plex.metadata(n.key) or n.data
                 n = n.parent
         except PlexError as e:
@@ -683,6 +715,9 @@ class App:
             return
         if node.children is not None:
             self.reload(node)
+        for hub in self.root.children or []:
+            if hub.kind == "hub" and hub.children is not None:
+                self.reload(hub)
 
     # navigation
 
@@ -744,7 +779,7 @@ class App:
                 node.expanded = True
         elif key == "p" and node.leaf:
             self.play(node, resume=False)
-        elif key == "w" and node.kind not in ("root", "section"):
+        elif key == "w" and node.kind not in CONTAINERS:
             self.toggle_watched(node)
         elif key == "r":
             target = node if node.expanded else (node.parent or self.root)
@@ -832,8 +867,9 @@ class App:
 
     def marker(self, node):
         T = self.theme
-        if node.kind == "section":
-            return SECTION_ICONS.get(node.data.get("type"), "•"), T.fg("accent")
+        if node.kind in ("section", "hub"):
+            icon = node.data.get("hub") or node.data.get("type")
+            return SECTION_ICONS.get(icon, "•"), T.fg("accent")
         if node.in_progress():
             return "◐", T.fg("accent")
         if not node.watched():
@@ -880,6 +916,13 @@ class App:
             para("movie library" if d.get("type") == "movie" else "tv library", dim)
             if node.children is not None:
                 para(plural(len(node.children), "title"), dim)
+            return lines
+
+        if node.kind == "hub":
+            para(d["title"], bright)
+            para(d["summary"], dim)
+            if node.children is not None:
+                para(plural(len(node.children), "item"), dim)
             return lines
 
         if node.kind == "episode":
