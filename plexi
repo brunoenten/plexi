@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """plexi — a lightweight, keyboard-driven Plex client that wears your Omarchy theme."""
 
+import concurrent.futures
 import json
+import logging
+import logging.handlers
 import os
 import queue
+import re
 import select
 import shutil
 import signal
@@ -22,13 +26,15 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from http.client import HTTPException
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PRODUCT = "plexi"
 
 XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
 CONFIG_PATH = os.path.join(XDG_CONFIG, "plexi", "config.toml")
+LOG_PATH = os.path.join(XDG_STATE, "plexi", "plexi.log")
 THEME_PATHS = [
     os.path.join(XDG_STATE, "omarchy/current/theme/colors.toml"),
     os.path.join(XDG_CONFIG, "omarchy/current/theme/colors.toml"),
@@ -41,6 +47,7 @@ usage:
   plexi           browse your libraries (signs in on first run)
   plexi login     sign in again / pick another server
   plexi logout    forget the saved server and token
+  plexi log       show the end of the log (requests, addresses tried, errors)
 
 env:
   PLEX_URL, PLEX_TOKEN   override the saved server and token
@@ -50,8 +57,23 @@ keys:
   h ←       back / collapse  enter play (resumes) or toggle
   p         play from start  w     toggle watched
   /         find (n/N next)  r     reload
-  g/G       top / bottom     q     quit
+  g/G       top / bottom     c     reconnect (try every server address)
+  esc       cancel a request q     quit
 """
+
+log = logging.getLogger("plexi")
+
+
+def setup_logging():
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
+    handler = logging.handlers.RotatingFileHandler(LOG_PATH, maxBytes=512 * 1024, backupCount=1, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-5s %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(logging.DEBUG if os.environ.get("PLEXI_DEBUG") else logging.INFO)
+
+
+def redact(url):
+    return re.sub(r"(X-Plex-Token=)[^&]+", r"\1…", url)
 
 # ── theme ────────────────────────────────────────────────────────────────
 
@@ -175,7 +197,9 @@ def fmt_clock(ms):
 
 
 def plural(n, word):
-    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+    if n == 1:
+        return f"{n} {word}"
+    return f"{n} {word}es" if word.endswith("s") else f"{n} {word}s"
 
 
 # ── plex ─────────────────────────────────────────────────────────────────
@@ -187,6 +211,7 @@ class PlexError(Exception):
 
 def client_headers(client_id, token=None):
     headers = {
+        "User-Agent": f"{PRODUCT}/{VERSION}",
         "Accept": "application/json",
         "X-Plex-Product": PRODUCT,
         "X-Plex-Version": VERSION,
@@ -200,17 +225,100 @@ def client_headers(client_id, token=None):
     return headers
 
 
-def http(url, headers, method="GET", timeout=10, parse=True):
+_create_connection = socket.create_connection
+
+
+def happy_connect(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, *args, **kwargs):
+    """Race IPv6 and IPv4 addresses (RFC 8305 style), so a broken IPv6 route
+    doesn't stall every request until it times out."""
+    host, port = address[:2]
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except OSError:
+        infos = []
+    if len(infos) < 2:
+        return _create_connection(address, timeout, source_address, *args, **kwargs)
+    v6 = [i for i in infos if i[0] == socket.AF_INET6]
+    v4 = [i for i in infos if i[0] != socket.AF_INET6]
+    ordered = [i for pair in zip(v6 + [None] * len(v4), v4 + [None] * len(v6)) for i in pair if i]
+    limit = None if timeout is socket._GLOBAL_DEFAULT_TIMEOUT else timeout
+    results, lock, state = queue.Queue(), threading.Lock(), {"done": False}
+
+    def attempt(info):
+        family, kind, proto, _, addr = info
+        sock = socket.socket(family, kind, proto)
+        try:
+            sock.settimeout(limit)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(addr)
+        except OSError as e:
+            sock.close()
+            results.put((None, e))
+            return
+        with lock:
+            if state["done"]:
+                sock.close()
+                return
+            state["done"] = True
+        log.debug("connected to %s via %s", host, addr[0])
+        results.put((sock, None))
+
+    deadline = time.monotonic() + (limit or 30)
+    errors, started = [], 0
+    try:
+        for info in ordered:
+            threading.Thread(target=attempt, args=(info,), daemon=True).start()
+            started += 1
+            try:
+                sock, err = results.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            if sock:
+                return sock
+            errors.append(err)
+        while len(errors) < started and time.monotonic() < deadline:
+            try:
+                sock, err = results.get(timeout=max(0.01, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if sock:
+                return sock
+            errors.append(err)
+    finally:
+        with lock:
+            state["done"] = True
+    raise errors[-1] if errors else TimeoutError("timed out")
+
+
+socket.create_connection = happy_connect
+
+
+class ConnectionFailed(PlexError):
+    """The server didn't answer at all (DNS, refused, timeout, TLS) — another address may work."""
+
+
+class Cancelled(PlexError):
+    pass
+
+
+def http(url, headers, method="GET", timeout=8, parse=True):
     req = urllib.request.Request(url, method=method, headers=headers, data=b"" if method == "POST" else None)
     host = urllib.parse.urlsplit(url).netloc
+    started = time.monotonic()
+    elapsed = lambda: f"{(time.monotonic() - started) * 1000:.0f}ms"
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = resp.read()
     except urllib.error.HTTPError as e:
+        log.warning("%s %s → HTTP %s in %s", method, redact(url), e.code, elapsed())
         hint = " (token rejected — run `plexi login`)" if e.code == 401 else ""
         raise PlexError(f"HTTP {e.code} from {host}{hint}") from e
-    except (urllib.error.URLError, OSError) as e:
-        raise PlexError(f"can't reach {host}: {getattr(e, 'reason', e)}") from e
+    except (urllib.error.URLError, OSError, HTTPException, ValueError) as e:
+        reason = getattr(e, "reason", None) or e
+        log.warning("%s %s ✗ %s after %s", method, redact(url), reason, elapsed())
+        raise ConnectionFailed(f"can't reach {host}: {reason}") from e
+    log.info("%s %s → %s in %s", method, redact(url), resp.status, elapsed())
     if not parse or not body.strip():
         return {}
     try:
@@ -241,6 +349,8 @@ class Plex:
     def continue_watching(self):
         try:
             items = self.get("/hubs/continueWatching/items").get("Metadata", [])
+        except ConnectionFailed:
+            raise
         except PlexError:
             items = self.get("/library/onDeck").get("Metadata", [])
         return [i for i in items if i.get("type") in PLAYABLE]
@@ -301,6 +411,80 @@ def save_config(cfg):
     os.replace(tmp, CONFIG_PATH)
 
 
+RESOURCES_URL = "https://clients.plex.tv/api/v2/resources?includeHttps=1&includeRelay=1&includeIPv6=1"
+
+
+def fetch_servers(client_id, token):
+    resources = http(RESOURCES_URL, client_headers(client_id, token), timeout=10)
+    return [r for r in resources if "server" in (r.get("provides") or "")]
+
+
+def ranked_uris(server):
+    """Connection URIs in preference order: local, then remote, then Plex relay."""
+    conns = sorted(server.get("connections") or [], key=lambda c: (bool(c.get("relay")), not c.get("local")))
+    for c in conns:
+        kind = "relay" if c.get("relay") else "local" if c.get("local") else "remote"
+        log.info("  candidate %-6s %s", kind, c["uri"])
+    return [c["uri"] for c in conns]
+
+
+def probe(uris, client_id, token, timeout=4):
+    """Try every address at once; return the most preferred one that answers, or None."""
+    if not uris:
+        return None
+    log.info("probing %d address(es)", len(uris))
+    headers = client_headers(client_id, token)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=len(uris))
+    futures = {pool.submit(http, uri.rstrip("/") + "/identity", headers, timeout=timeout): uri for uri in uris}
+    working, pending = set(), set(futures)
+    deadline = time.monotonic() + timeout + 1
+    try:
+        while pending and time.monotonic() < deadline:
+            done, pending = concurrent.futures.wait(pending, timeout=deadline - time.monotonic(), return_when="FIRST_COMPLETED")
+            working |= {futures[f] for f in done if f.exception() is None}
+            if working:
+                if uris[0] in working:
+                    break
+                # a less preferred address answered: give better ones a moment longer
+                deadline = min(deadline, time.monotonic() + 1)
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    best = next((uri for uri in uris if uri in working), None)
+    log.info("probe result: %s", best or "no address answered")
+    return best
+
+
+def rediscover(cfg):
+    """Ask plex.tv for the server's current addresses and pick one that works.
+
+    Returns the updated config (already saved) or raises PlexError.
+    """
+    client_id = cfg["client_id"]
+    token = cfg.get("account_token") or cfg["token"]
+    saved = cfg.get("connections") or []
+    uri = probe(saved, client_id, cfg["token"]) if saved else None
+    if not uri:
+        log.info("asking plex.tv for %s's current addresses", cfg.get("server_name"))
+        servers = fetch_servers(client_id, token)
+        machine = cfg.get("machine_id")
+        server = next(
+            (s for s in servers if (machine and s.get("clientIdentifier") == machine) or s.get("name") == cfg.get("server_name")),
+            None,
+        )
+        if not server:
+            raise PlexError(f"{cfg.get('server_name', 'server')} isn't on your Plex account anymore — run `plexi login`")
+        saved = ranked_uris(server)
+        cfg.update(connections=saved, machine_id=server.get("clientIdentifier", ""), token=server.get("accessToken") or cfg["token"])
+        uri = probe(saved, client_id, cfg["token"])
+    if not uri:
+        raise ConnectionFailed(f"none of {cfg.get('server_name', 'the server')}'s {len(saved)} addresses answered")
+    if uri != cfg.get("server"):
+        log.info("switching server address %s → %s", cfg.get("server"), uri)
+    cfg["server"] = uri
+    save_config(cfg)
+    return cfg
+
+
 def login(theme):
     accent, dim, fg = theme.fg("accent"), theme.fg("light_foreground"), theme.fg("foreground")
     cfg = load_config()
@@ -326,11 +510,7 @@ def login(theme):
     if not token:
         raise PlexError("sign-in timed out")
 
-    resources = http(
-        "https://clients.plex.tv/api/v2/resources?includeHttps=1&includeRelay=1",
-        client_headers(client_id, token),
-    )
-    servers = [r for r in resources if "server" in (r.get("provides") or "")]
+    servers = fetch_servers(client_id, token)
     if not servers:
         raise PlexError("no Plex Media Server found on this account")
 
@@ -346,23 +526,24 @@ def login(theme):
                 break
 
     server_token = server.get("accessToken") or token
-    connections = sorted(
-        server.get("connections") or [],
-        key=lambda c: (bool(c.get("relay")), not c.get("local")),
-    )
-    print(f"  {dim}connecting to {server['name']}…{RESET}", flush=True)
-    for conn in connections:
-        try:
-            http(conn["uri"].rstrip("/") + "/identity", client_headers(client_id, server_token), timeout=4)
-            break
-        except PlexError:
-            continue
-    else:
-        raise PlexError(f"couldn't reach {server['name']} on any of its addresses")
+    log.info("signed in; server %s (%s)", server["name"], server.get("clientIdentifier"))
+    uris = ranked_uris(server)
+    print(f"  {dim}trying {plural(len(uris), 'address')} for {server['name']}…{RESET}", flush=True)
+    uri = probe(uris, client_id, server_token)
 
-    cfg.update(server=conn["uri"], token=server_token, server_name=server["name"], client_id=client_id)
+    cfg.update(
+        server=uri or (uris[0] if uris else ""),
+        token=server_token,
+        account_token=token,
+        server_name=server["name"],
+        machine_id=server.get("clientIdentifier", ""),
+        connections=uris,
+        client_id=client_id,
+    )
     save_config(cfg)
-    print(f"  {theme.fg('green')}✓{RESET} {fg}signed in to {server['name']}{RESET}\n")
+    if not uri:
+        raise ConnectionFailed(f"signed in, but none of {server['name']}'s addresses answered (see `plexi log`)")
+    print(f"  {theme.fg('green')}✓{RESET} {fg}signed in to {server['name']} via {uri}{RESET}\n")
     return cfg
 
 
@@ -510,6 +691,7 @@ class Player(threading.Thread):
             "--",
             url,
         ]
+        log.info("mpv: %s (from %s)", redact(url), fmt_clock(self.offset))
         try:
             self.proc = subprocess.Popen(
                 cmd,
@@ -540,6 +722,7 @@ class Player(threading.Thread):
                 except PlexError:
                     pass
 
+        log.info("mpv exited with %s at %s", self.proc.returncode, fmt_clock(pos * 1000))
         if ipc:
             ipc.close()
         try:
@@ -594,18 +777,23 @@ HINTS = [
     ("j/k", "move"), ("l", "open"), ("h", "back"), ("enter", "play"),
     ("p", "from start"), ("w", "watched"), ("/", "find"), ("r", "reload"), ("q", "quit"),
 ]
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
 class App:
-    def __init__(self, plex, server_name):
+    def __init__(self, plex, cfg, fixed_server=False):
         self.plex = plex
-        self.server_name = server_name
+        self.cfg = cfg
+        self.fixed_server = fixed_server
+        self.server_name = cfg.get("server_name") or urllib.parse.urlsplit(plex.url).hostname or "plex"
+        self.activity = None
+        self.error = None
         self.theme = Theme()
         self.root = Node({}, "root", None)
         self.root.expanded = True
         self.sel = None
         self.top = 0
-        self.status = ("", "foreground", 0.0, False)
+        self.status = ("", "foreground", 0.0, 0)
         self.search = None
         self.search_origin = None
         self.last_search = ""
@@ -634,6 +822,9 @@ class App:
                     key = read_key(self.fd)
                     if key:
                         self.handle(key)
+        except Exception:
+            log.exception("crashed")
+            raise
         finally:
             self.write(RESET + "\x1b[?25h\x1b[?1049l")
             termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
@@ -642,8 +833,14 @@ class App:
         sys.stdout.write(s)
         sys.stdout.flush()
 
-    def flash(self, text, color="foreground", sticky=False):
-        self.status = (text, color, time.monotonic(), sticky)
+    def flash(self, text, color="foreground", ttl=4):
+        self.status = (text, color, time.monotonic(), ttl)
+
+    def fail(self, error, node=None):
+        log.error("%s", error)
+        self.flash(str(error), "red", ttl=10)
+        if node is self.root:
+            self.error = str(error)
 
     def drain_events(self):
         while True:
@@ -652,9 +849,86 @@ class App:
             except queue.Empty:
                 return
             if kind == "error":
-                self.flash(value, "red")
+                self.fail(value)
             elif kind == "played":
                 self.refresh_meta(value)
+
+    # network
+
+    @property
+    def host(self):
+        return urllib.parse.urlsplit(self.plex.url).netloc
+
+    def busy(self, label, fn):
+        """Run fn on a worker thread while keeping the UI drawn; esc/q cancels."""
+        box = {}
+
+        def target():
+            try:
+                box["value"] = fn()
+            except BaseException as e:
+                box["error"] = e
+
+        worker = threading.Thread(target=target, daemon=True)
+        self.activity = [label, time.monotonic()]
+        worker.start()
+        try:
+            while worker.is_alive():
+                self.render()
+                if select.select([self.fd], [], [], 0.1)[0] and read_key(self.fd) in ("esc", "q", "ctrl-c"):
+                    log.info("cancelled: %s", self.activity[0])
+                    raise Cancelled("cancelled")
+        finally:
+            self.activity = None
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+    def switch(self, cfg):
+        self.cfg = cfg
+        self.plex = Plex(cfg["server"], cfg["token"], cfg["client_id"])
+
+    def net(self, label, fn):
+        """A Plex call with spinner, cancel, and failover to another server address."""
+
+        def work():
+            try:
+                return fn()
+            except ConnectionFailed as e:
+                if self.fixed_server:
+                    raise
+                log.warning("%s — looking for another address", e)
+                self.activity[0] = f"{self.host} isn't answering — trying other addresses"
+                try:
+                    self.switch(rediscover(self.cfg))
+                except PlexError as again:
+                    log.error("failover failed: %s", again)
+                    raise ConnectionFailed(f"{e} — and no other address answered") from again
+                self.activity[0] = f"{label} via {self.host}"
+                return fn()
+
+        return self.busy(label, work)
+
+    def reconnect(self):
+        if self.fixed_server:
+            self.flash("PLEX_URL is set — not switching addresses", "yellow")
+            return
+
+        def work():
+            cfg = dict(self.cfg)
+            cfg.pop("connections", None)
+            self.switch(rediscover(cfg))
+
+        try:
+            self.busy("asking plex.tv for the server's addresses", work)
+        except Cancelled:
+            self.flash("cancelled", "light_foreground")
+            return
+        except PlexError as e:
+            self.fail(e, self.root if not self.root.children else None)
+            return
+        self.flash(f"connected via {self.host}", "green")
+        self.reload(self.root)
 
     # data
 
@@ -670,13 +944,19 @@ class App:
     def load(self, node, force=False):
         if node.children is not None and not force:
             return True
-        self.flash("loading…", "light_foreground", sticky=True)
-        self.render()
+        label = f"connecting to {self.host}" if node is self.root else f"loading {node.data.get('title', '')}"
         try:
-            items = self.fetch(node)
-        except PlexError as e:
-            self.flash(str(e), "red")
+            items = self.net(label, lambda: self.fetch(node))
+        except Cancelled:
+            self.flash("cancelled", "light_foreground")
+            if node is self.root:
+                self.error = "connection cancelled"
             return False
+        except PlexError as e:
+            self.fail(e, node)
+            return False
+        if node is self.root:
+            self.error = None
         existing = {c.key: c for c in node.children or []}
         children = []
         for data in items:
@@ -705,14 +985,22 @@ class App:
         return True
 
     def refresh_meta(self, node):
-        try:
-            n = node
+        def work():
+            updates, n = [], node
             while n and n.kind not in CONTAINERS:
-                n.data = self.plex.metadata(n.key) or n.data
+                updates.append((n, self.plex.metadata(n.key)))
                 n = n.parent
-        except PlexError as e:
-            self.flash(str(e), "red")
+            return updates
+
+        try:
+            updates = self.net("refreshing", work)
+        except Cancelled:
             return
+        except PlexError as e:
+            self.fail(e)
+            return
+        for n, data in updates:
+            n.data = data or n.data
         if node.children is not None:
             self.reload(node)
         for hub in self.root.children or []:
@@ -757,6 +1045,8 @@ class App:
             self.running = False
         elif key in moves and rows:
             self.sel = rows[max(0, min(len(rows) - 1, moves[key]))]
+        elif key == "c":
+            self.reconnect()
         elif node is None:
             if key == "r":
                 self.load(self.root, force=True)
@@ -856,9 +1146,11 @@ class App:
     def toggle_watched(self, node):
         want = not node.watched()
         try:
-            self.plex.scrobble(node.key, want)
+            self.net("marking " + ("watched" if want else "unwatched"), lambda: self.plex.scrobble(node.key, want))
+        except Cancelled:
+            return
         except PlexError as e:
-            self.flash(str(e), "red")
+            self.fail(e)
             return
         self.refresh_meta(node)
         self.flash("marked watched" if want else "marked unwatched", "green")
@@ -995,9 +1287,39 @@ class App:
             para(" · ".join(tech), T.fg("dark_foreground"))
         return lines
 
+    def empty_panel(self):
+        T = self.theme
+        dim, fg, key = T.fg("light_foreground"), T.fg("foreground"), T.fg("accent")
+        if self.activity:
+            spin = SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
+            return [[], [(spin + " ", key), (self.activity[0] + "…", fg)]]
+        if not self.error:
+            return [[], [("nothing here yet", dim)]]
+        addresses = self.cfg.get("connections") or []
+        lines = [
+            [],
+            [("✗ ", T.fg("red") + BOLD), (self.error, T.fg("red"))],
+            [],
+            [("server   ", dim), (self.server_name, fg)],
+            [("address  ", dim), (self.plex.url, fg)],
+        ]
+        if addresses:
+            lines.append([("known    ", dim), (plural(len(addresses), "address"), fg)])
+        lines += [
+            [],
+            [("r", key), (" retry   ", dim), ("c", key), (" reconnect (ask plex.tv for every address)   ", dim), ("q", key), (" quit", dim)],
+            [],
+            [("log      ", dim), (LOG_PATH.replace(os.path.expanduser("~"), "~"), fg)],
+        ]
+        return lines
+
     def current_status(self):
-        text, color, at, sticky = self.status
-        if text and (sticky or time.monotonic() - at < 4):
+        if self.activity:
+            label, started = self.activity
+            spin = SPINNER[int(time.monotonic() * 10) % len(SPINNER)]
+            return f"{spin} {label} · {time.monotonic() - started:.0f}s · esc cancel", "light_foreground"
+        text, color, at, ttl = self.status
+        if text and time.monotonic() - at < ttl:
             return text, color
         if self.player and self.player.is_alive():
             return f"▶ {self.player.title}", "accent"
@@ -1036,11 +1358,17 @@ class App:
         lines.append(str(top))
 
         detail = self.details(self.sel, dw) if dw and self.sel else []
+        panel = [] if rows else self.empty_panel()
         for y in range(body):
             ln = Line(w).add("│", frame)
             r = self.top + y
             if r < len(rows):
                 ln.raw(self.tree_row(rows[r], tw, r == cur), tw)
+            elif y < len(panel):
+                cell = Line(tw).add("  ")
+                for text, style in panel[y]:
+                    cell.add(text, style)
+                ln.raw(str(cell), tw)
             else:
                 ln.add(" " * tw)
             if dw:
@@ -1090,10 +1418,20 @@ def main(argv):
         save_config({"client_id": cfg["client_id"]} if cfg.get("client_id") else {})
         print("signed out")
         return 0
+    if cmd == "log":
+        print(LOG_PATH)
+        try:
+            with open(LOG_PATH, encoding="utf-8") as f:
+                sys.stdout.writelines(f.readlines()[-60:])
+        except OSError:
+            print("(no log yet)")
+        return 0
     if cmd not in ("", "login"):
         print(USAGE, end="", file=sys.stderr)
         return 2
 
+    setup_logging()
+    log.info("plexi %s starting (python %s)", VERSION, sys.version.split()[0])
     theme = Theme()
     cfg = load_config()
     url = os.environ.get("PLEX_URL") or cfg.get("server")
@@ -1120,8 +1458,9 @@ def main(argv):
         cfg["client_id"] = str(uuid.uuid4())
         save_config(cfg)
 
-    name = cfg.get("server_name") or urllib.parse.urlsplit(url).hostname or "plex"
-    App(Plex(url, token, cfg["client_id"]), name).run()
+    fixed = bool(os.environ.get("PLEX_URL"))
+    log.info("server %s at %s%s", cfg.get("server_name", "?"), url, " (PLEX_URL)" if fixed else "")
+    App(Plex(url, token, cfg["client_id"]), cfg, fixed_server=fixed).run()
     return 0
 
 

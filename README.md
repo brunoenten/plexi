@@ -60,6 +60,7 @@ An AUR package is coming once AUR registrations reopen.
 plexi           browse your libraries (signs in on first run)
 plexi login     sign in again / pick another server
 plexi logout    forget the saved server and token
+plexi log       show the end of the log
 ```
 
 | Key | Action |
@@ -72,6 +73,8 @@ plexi logout    forget the saved server and token
 | `w` | toggle watched |
 | `/` then `n` `N` | find, next, previous |
 | `r` | reload |
+| `c` | reconnect (ask plex.tv for every server address) |
+| `esc` | cancel a slow request |
 | `g` `G` · `ctrl-d` `ctrl-u` | top, bottom · half page |
 | `q` | quit |
 
@@ -84,6 +87,18 @@ PLEX_URL=http://192.168.1.10:32400 PLEX_TOKEN=xxxx plexi
 ```
 
 Colors are read from `~/.local/state/omarchy/current/theme/colors.toml`. Outside Omarchy, plexi falls back to a neutral dark palette.
+
+## Troubleshooting
+
+Plexi remembers every address Plex advertises for your server (local, remote, relay). If the current one stops answering, it tries all of them in parallel, asks plex.tv for fresh ones if needed, and switches to the best one that responds. IPv6 and IPv4 are raced too, so a broken IPv6 route doesn't stall anything.
+
+Every request, the addresses tried and their results are logged (tokens redacted) to `~/.local/state/plexi/plexi.log`:
+
+```sh
+plexi log
+```
+
+Set `PLEXI_DEBUG=1` for extra detail, such as which IP each connection used.
 
 ## Notes
 
