@@ -32,7 +32,7 @@ Browse your libraries as a tree — **library → show → season → episode** 
 On Omarchy / Arch, install the package from the [latest release](https://github.com/brunoenten/plexi/releases/latest):
 
 ```sh
-sudo pacman -U https://github.com/brunoenten/plexi/releases/download/v0.2.0/plexi-0.2.0-1-any.pkg.tar.zst
+sudo pacman -U https://github.com/brunoenten/plexi/releases/download/v0.3.0/plexi-0.3.0-1-any.pkg.tar.zst
 ```
 
 Then launch **Plexi** from the app launcher (<kbd>Super</kbd> + <kbd>Space</kbd>), or run `plexi` in a terminal.
