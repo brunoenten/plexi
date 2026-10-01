@@ -1,0 +1,33 @@
+name: Feedback triage
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+    inputs:
+      window_hours:
+        description: How many hours back to look
+        default: "24"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency: feedback-triage
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet cursor-sdk
+      - run: python .github/feedback/triage.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          FEEDBACK_DISCUSSIONS: omacom/omarchy#13931
+          FEEDBACK_WINDOW_HOURS: ${{ inputs.window_hours || '24' }}
