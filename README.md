@@ -28,20 +28,30 @@ Browse your libraries as a tree — **library → show → season → episode** 
 
 ## Install
 
-On Omarchy / Arch, from the AUR:
+On Omarchy / Arch, install the package from the [latest release](https://github.com/brunoenten/plexi/releases/latest):
 
 ```sh
-omarchy pkg aur add plexi
+sudo pacman -U https://github.com/brunoenten/plexi/releases/download/v0.1.0/plexi-0.1.0-1-any.pkg.tar.zst
 ```
 
 Then launch **Plexi** from the app launcher (<kbd>Super</kbd> + <kbd>Space</kbd>), or run `plexi` in a terminal.
 
-Manually, anywhere with Python 3.11+ and mpv:
+Prefer building it yourself? Each release also ships its `PKGBUILD`:
 
 ```sh
-curl -Lo ~/.local/bin/plexi https://raw.githubusercontent.com/OWNER/plexi/main/plexi
+mkdir plexi && cd plexi
+curl -LO https://github.com/brunoenten/plexi/releases/latest/download/PKGBUILD
+makepkg -si
+```
+
+Anywhere else with Python 3.11+ and mpv, it's a single file:
+
+```sh
+curl -Lo ~/.local/bin/plexi https://raw.githubusercontent.com/brunoenten/plexi/main/plexi
 chmod +x ~/.local/bin/plexi
 ```
+
+An AUR package is coming once AUR registrations reopen.
 
 ## Usage
 
