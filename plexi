@@ -1,0 +1,1086 @@
+#!/usr/bin/env python3
+"""plexi — a lightweight, keyboard-driven Plex client that wears your Omarchy theme."""
+
+import json
+import os
+import queue
+import select
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import termios
+import textwrap
+import threading
+import time
+import tomllib
+import tty
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+VERSION = "0.1.0"
+PRODUCT = "plexi"
+
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+CONFIG_PATH = os.path.join(XDG_CONFIG, "plexi", "config.toml")
+THEME_PATHS = [
+    os.path.join(XDG_STATE, "omarchy/current/theme/colors.toml"),
+    os.path.join(XDG_CONFIG, "omarchy/current/theme/colors.toml"),
+]
+
+USAGE = """\
+plexi — keyboard-driven Plex client
+
+usage:
+  plexi           browse your libraries (signs in on first run)
+  plexi login     sign in again / pick another server
+  plexi logout    forget the saved server and token
+
+env:
+  PLEX_URL, PLEX_TOKEN   override the saved server and token
+
+keys:
+  j/k ↑/↓   move            l →   open / expand
+  h ←       back / collapse  enter play (resumes) or toggle
+  p         play from start  w     toggle watched
+  /         find (n/N next)  r     reload
+  g/G       top / bottom     q     quit
+"""
+
+# ── theme ────────────────────────────────────────────────────────────────
+
+FALLBACK = {
+    "accent": "#7aa2f7",
+    "selection": "#333333",
+    "foreground": "#efefef",
+    "dark_foreground": "#555555",
+    "light_foreground": "#8a8a8d",
+    "bright_foreground": "#ffffff",
+    "red": "#d35f5f",
+    "yellow": "#ffc107",
+    "green": "#8a9a7b",
+}
+RESET = "\x1b[0m"
+BOLD = "\x1b[1m"
+
+
+def _rgb(value):
+    h = value.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
+class Theme:
+    def __init__(self):
+        self.colors = dict(FALLBACK)
+        self.stamp = None
+        self.reload()
+
+    def reload(self):
+        path = next((p for p in THEME_PATHS if os.path.exists(p)), None)
+        if not path:
+            return
+        try:
+            stamp = (path, os.stat(path).st_mtime)
+            if stamp == self.stamp:
+                return
+            with open(path, "rb") as f:
+                data = tomllib.load(f)
+        except (OSError, tomllib.TOMLDecodeError):
+            return
+        self.stamp = stamp
+        colors = {k: v for k, v in data.items() if isinstance(v, str) and len(v) == 7 and v[0] == "#"}
+        self.colors = {**FALLBACK, **colors}
+
+    def fg(self, name):
+        return "\x1b[38;2;%d;%d;%dm" % _rgb(self.colors[name])
+
+    def bg(self, name):
+        return "\x1b[48;2;%d;%d;%dm" % _rgb(self.colors[name])
+
+
+# ── text helpers ─────────────────────────────────────────────────────────
+
+
+def cwidth(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+
+
+def wlen(s):
+    return sum(cwidth(c) for c in s)
+
+
+def trunc(s, width):
+    if width <= 0:
+        return ""
+    if wlen(s) <= width:
+        return s
+    out, used = [], 0
+    for ch in s:
+        w = cwidth(ch)
+        if used + w > width - 1:
+            break
+        out.append(ch)
+        used += w
+    return "".join(out) + "…"
+
+
+class Line:
+    """A fixed-width row of styled segments."""
+
+    def __init__(self, width, base=""):
+        self.width, self.base, self.parts, self.used = width, base, [], 0
+
+    def add(self, text, style=""):
+        text = trunc(text, self.width - self.used)
+        if text:
+            self.parts.append(self.base + style + text + RESET)
+            self.used += wlen(text)
+        return self
+
+    def right(self, text, style=""):
+        gap = self.width - self.used - wlen(text)
+        if gap > 0:
+            self.add(" " * gap)
+        return self.add(text, style)
+
+    def raw(self, rendered, width):
+        self.parts.append(rendered)
+        self.used += width
+        return self
+
+    def __str__(self):
+        if self.used < self.width:
+            self.add(" " * (self.width - self.used))
+        return "".join(self.parts)
+
+
+def fmt_duration(ms):
+    m = int(ms or 0) // 60000
+    return f"{m // 60}h {m % 60:02d}m" if m >= 60 else f"{m}m"
+
+
+def fmt_clock(ms):
+    s = int(ms or 0) // 1000
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def plural(n, word):
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+# ── plex ─────────────────────────────────────────────────────────────────
+
+
+class PlexError(Exception):
+    pass
+
+
+def client_headers(client_id, token=None):
+    headers = {
+        "Accept": "application/json",
+        "X-Plex-Product": PRODUCT,
+        "X-Plex-Version": VERSION,
+        "X-Plex-Client-Identifier": client_id,
+        "X-Plex-Platform": "Linux",
+        "X-Plex-Device": "Linux",
+        "X-Plex-Device-Name": socket.gethostname(),
+    }
+    if token:
+        headers["X-Plex-Token"] = token
+    return headers
+
+
+def http(url, headers, method="GET", timeout=10, parse=True):
+    req = urllib.request.Request(url, method=method, headers=headers, data=b"" if method == "POST" else None)
+    host = urllib.parse.urlsplit(url).netloc
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        hint = " (token rejected — run `plexi login`)" if e.code == 401 else ""
+        raise PlexError(f"HTTP {e.code} from {host}{hint}") from e
+    except (urllib.error.URLError, OSError) as e:
+        raise PlexError(f"can't reach {host}: {getattr(e, 'reason', e)}") from e
+    if not parse or not body.strip():
+        return {}
+    try:
+        return json.loads(body)
+    except ValueError as e:
+        raise PlexError(f"unexpected response from {host}") from e
+
+
+class Plex:
+    def __init__(self, url, token, client_id):
+        self.url = url.rstrip("/")
+        self.token = token
+        self.headers = client_headers(client_id, token)
+
+    def _url(self, path, params):
+        return self.url + path + ("?" + urllib.parse.urlencode(params) if params else "")
+
+    def get(self, path, **params):
+        return http(self._url(path, params), self.headers).get("MediaContainer", {})
+
+    def call(self, path, **params):
+        http(self._url(path, params), self.headers, parse=False)
+
+    def sections(self):
+        dirs = self.get("/library/sections").get("Directory", [])
+        return [d for d in dirs if d.get("type") in ("movie", "show")]
+
+    def items(self, section_key):
+        return self.get(f"/library/sections/{section_key}/all").get("Metadata", [])
+
+    def children(self, rating_key):
+        return self.get(f"/library/metadata/{rating_key}/children", excludeAllLeaves=1).get("Metadata", [])
+
+    def metadata(self, rating_key):
+        found = self.get(f"/library/metadata/{rating_key}").get("Metadata") or [None]
+        return found[0]
+
+    def stream_url(self, item):
+        part = item["Media"][0]["Part"][0]["key"]
+        return self._url(part, {"X-Plex-Token": self.token})
+
+    def scrobble(self, rating_key, watched=True):
+        path = "/:/scrobble" if watched else "/:/unscrobble"
+        self.call(path, identifier="com.plexapp.plugins.library", key=rating_key)
+
+    def timeline(self, item, state, time_ms):
+        rk = item["ratingKey"]
+        self.call(
+            "/:/timeline",
+            ratingKey=rk,
+            key=f"/library/metadata/{rk}",
+            state=state,
+            time=int(time_ms),
+            duration=int(item.get("duration") or 0),
+        )
+
+
+# ── config & login ───────────────────────────────────────────────────────
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def save_config(cfg):
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        for key, value in cfg.items():
+            f.write(f"{key} = {json.dumps(value)}\n")
+    os.replace(tmp, CONFIG_PATH)
+
+
+def login(theme):
+    accent, dim, fg = theme.fg("accent"), theme.fg("light_foreground"), theme.fg("foreground")
+    cfg = load_config()
+    client_id = cfg.get("client_id") or str(uuid.uuid4())
+    headers = client_headers(client_id)
+
+    pin = http("https://plex.tv/api/v2/pins?strong=true", headers, method="POST")
+    auth_url = "https://app.plex.tv/auth#?" + urllib.parse.urlencode(
+        {"clientID": client_id, "code": pin["code"], "context[device][product]": PRODUCT}
+    )
+    print(f"\n  {accent}{BOLD}plexi{RESET}{fg} — sign in to Plex in your browser{RESET}")
+    print(f"  {dim}{auth_url}{RESET}\n")
+    try:
+        subprocess.Popen(["xdg-open", auth_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        pass
+
+    print(f"  {dim}waiting for approval…{RESET}", flush=True)
+    token, deadline = None, time.monotonic() + 300
+    while not token and time.monotonic() < deadline:
+        time.sleep(2)
+        token = http(f"https://plex.tv/api/v2/pins/{pin['id']}", headers).get("authToken")
+    if not token:
+        raise PlexError("sign-in timed out")
+
+    resources = http(
+        "https://clients.plex.tv/api/v2/resources?includeHttps=1&includeRelay=1",
+        client_headers(client_id, token),
+    )
+    servers = [r for r in resources if "server" in (r.get("provides") or "")]
+    if not servers:
+        raise PlexError("no Plex Media Server found on this account")
+
+    server = servers[0]
+    if len(servers) > 1:
+        print()
+        for i, s in enumerate(servers, 1):
+            print(f"  {accent}{i}{RESET}  {fg}{s['name']}{RESET}")
+        while True:
+            choice = input(f"\n  {dim}server [1]:{RESET} ").strip() or "1"
+            if choice.isdigit() and 1 <= int(choice) <= len(servers):
+                server = servers[int(choice) - 1]
+                break
+
+    server_token = server.get("accessToken") or token
+    connections = sorted(
+        server.get("connections") or [],
+        key=lambda c: (bool(c.get("relay")), not c.get("local")),
+    )
+    print(f"  {dim}connecting to {server['name']}…{RESET}", flush=True)
+    for conn in connections:
+        try:
+            http(conn["uri"].rstrip("/") + "/identity", client_headers(client_id, server_token), timeout=4)
+            break
+        except PlexError:
+            continue
+    else:
+        raise PlexError(f"couldn't reach {server['name']} on any of its addresses")
+
+    cfg.update(server=conn["uri"], token=server_token, server_name=server["name"], client_id=client_id)
+    save_config(cfg)
+    print(f"  {theme.fg('green')}✓{RESET} {fg}signed in to {server['name']}{RESET}\n")
+    return cfg
+
+
+# ── tree ─────────────────────────────────────────────────────────────────
+
+LEAVES = ("movie", "episode")
+SECTION_ICONS = {"movie": "\uf008", "show": "\uf26c"}
+
+
+class Node:
+    __slots__ = ("data", "kind", "parent", "depth", "children", "expanded")
+
+    def __init__(self, data, kind, parent):
+        self.data = data
+        self.kind = kind
+        self.parent = parent
+        self.depth = parent.depth + 1 if parent else -1
+        self.children = None
+        self.expanded = False
+
+    @property
+    def key(self):
+        return self.data.get("ratingKey") or self.data.get("key")
+
+    @property
+    def leaf(self):
+        return self.kind in LEAVES
+
+    def in_progress(self):
+        return self.leaf and bool(self.data.get("viewOffset"))
+
+    def watched(self):
+        d = self.data
+        if self.leaf:
+            return d.get("viewCount", 0) > 0 and not d.get("viewOffset")
+        leaves = d.get("leafCount", 0)
+        return leaves > 0 and d.get("viewedLeafCount", 0) >= leaves
+
+    def label(self):
+        d = self.data
+        if self.kind == "episode" and "index" in d:
+            return f"{d['index']:>2}  {d.get('title', '')}"
+        return d.get("title", "")
+
+    def meta(self):
+        d = self.data
+        if self.kind == "section":
+            return str(len(self.children)) if self.children is not None else ""
+        if self.kind == "show":
+            parts = [str(d["year"])] if d.get("year") else []
+            if d.get("childCount"):
+                parts.append(plural(d["childCount"], "season"))
+            return " · ".join(parts)
+        if self.kind == "season":
+            return f"{d.get('viewedLeafCount', 0)}/{d.get('leafCount', 0)}"
+        if self.kind == "episode":
+            if self.in_progress():
+                return f"{fmt_duration(d.get('duration', 0) - d['viewOffset'])} left"
+            return fmt_duration(d.get("duration")) if d.get("duration") else ""
+        if self.kind == "movie":
+            parts = [str(d["year"])] if d.get("year") else []
+            if d.get("duration"):
+                parts.append(fmt_duration(d["duration"]))
+            return " · ".join(parts)
+        return ""
+
+    def media_title(self):
+        d = self.data
+        if self.kind == "episode":
+            return f"{d.get('grandparentTitle', '')} — S{d.get('parentIndex', 0):02d}E{d.get('index', 0):02d} — {d.get('title', '')}"
+        if d.get("year"):
+            return f"{d.get('title', '')} ({d['year']})"
+        return d.get("title", "")
+
+
+# ── playback ─────────────────────────────────────────────────────────────
+
+
+class MpvIPC:
+    def __init__(self, path):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(1)
+        self.sock.connect(path)
+        self.buf = b""
+        self.rid = 0
+
+    def get(self, prop):
+        self.rid += 1
+        msg = {"command": ["get_property", prop], "request_id": self.rid}
+        self.sock.sendall(json.dumps(msg).encode() + b"\n")
+        while True:
+            while b"\n" not in self.buf:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    raise OSError("mpv closed the socket")
+                self.buf += chunk
+            line, self.buf = self.buf.split(b"\n", 1)
+            reply = json.loads(line)
+            if reply.get("request_id") == self.rid:
+                return reply.get("data") if reply.get("error") == "success" else None
+
+    def close(self):
+        self.sock.close()
+
+
+class Player(threading.Thread):
+    """Runs mpv for one item and reports progress back to Plex."""
+
+    def __init__(self, app, node, offset_ms):
+        super().__init__(daemon=True)
+        self.app, self.node, self.offset = app, node, offset_ms
+        self.title = node.media_title()
+        self.proc = None
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+    def run(self):
+        plex, item = self.app.plex, self.node.data
+        sock = os.path.join(tempfile.gettempdir(), f"plexi-{os.getpid()}-{item['ratingKey']}.sock")
+        try:
+            url = plex.stream_url(item)
+        except (KeyError, IndexError):
+            self.app.events.put(("error", "nothing playable for this item"))
+            return
+        cmd = [
+            "mpv",
+            "--force-window=immediate",
+            f"--force-media-title={self.title}",
+            f"--input-ipc-server={sock}",
+            f"--start={self.offset / 1000:.3f}",
+            "--",
+            url,
+        ]
+        try:
+            self.proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            self.app.events.put(("error", "mpv not found — install it with `omarchy pkg add mpv`"))
+            return
+
+        pos, paused, ipc, last_report = self.offset / 1000, False, None, 0.0
+        while self.proc.poll() is None:
+            time.sleep(1)
+            try:
+                ipc = ipc or MpvIPC(sock)
+                p = ipc.get("time-pos")
+                if isinstance(p, (int, float)):
+                    pos = p
+                paused = bool(ipc.get("pause"))
+            except (OSError, ValueError):
+                ipc = None
+            if time.monotonic() - last_report >= 10:
+                last_report = time.monotonic()
+                try:
+                    plex.timeline(item, "paused" if paused else "playing", pos * 1000)
+                except PlexError:
+                    pass
+
+        if ipc:
+            ipc.close()
+        try:
+            os.unlink(sock)
+        except OSError:
+            pass
+        duration = item.get("duration") or 0
+        try:
+            plex.timeline(item, "stopped", pos * 1000)
+            if duration and pos * 1000 >= duration * 0.9:
+                plex.scrobble(item["ratingKey"])
+        except PlexError:
+            pass
+        self.app.events.put(("played", self.node))
+
+
+# ── input ────────────────────────────────────────────────────────────────
+
+ESCAPES = {
+    b"[A": "up", b"[B": "down", b"[C": "right", b"[D": "left",
+    b"OA": "up", b"OB": "down", b"OC": "right", b"OD": "left",
+    b"[H": "home", b"[F": "end", b"OH": "home", b"OF": "end",
+    b"[1~": "home", b"[4~": "end", b"[5~": "pgup", b"[6~": "pgdn",
+}
+CONTROLS = {3: "ctrl-c", 4: "ctrl-d", 21: "ctrl-u", 9: "tab"}
+
+
+def read_key(fd):
+    b = os.read(fd, 1)
+    if not b:
+        return None
+    c = b[0]
+    if c == 0x1B:
+        if not select.select([fd], [], [], 0.03)[0]:
+            return "esc"
+        return ESCAPES.get(os.read(fd, 8))
+    if c in (10, 13):
+        return "enter"
+    if c in (8, 127):
+        return "backspace"
+    if c < 32:
+        return CONTROLS.get(c)
+    extra = 0 if c < 0x80 else 1 if c >> 5 == 0b110 else 2 if c >> 4 == 0b1110 else 3
+    if extra:
+        b += os.read(fd, extra)
+    return b.decode("utf-8", "replace")
+
+
+# ── app ──────────────────────────────────────────────────────────────────
+
+HINTS = [
+    ("j/k", "move"), ("l", "open"), ("h", "back"), ("enter", "play"),
+    ("p", "from start"), ("w", "watched"), ("/", "find"), ("r", "reload"), ("q", "quit"),
+]
+
+
+class App:
+    def __init__(self, plex, server_name):
+        self.plex = plex
+        self.server_name = server_name
+        self.theme = Theme()
+        self.root = Node({}, "root", None)
+        self.root.expanded = True
+        self.sel = None
+        self.top = 0
+        self.status = ("", "foreground", 0.0, False)
+        self.search = None
+        self.search_origin = None
+        self.last_search = ""
+        self.revealed = []
+        self.events = queue.Queue()
+        self.player = None
+        self.running = True
+        self.resized = True
+        self.body_height = 10
+        self.fd = sys.stdin.fileno()
+
+    # lifecycle
+
+    def run(self):
+        saved = termios.tcgetattr(self.fd)
+        signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "resized", True))
+        try:
+            tty.setraw(self.fd)
+            self.write("\x1b[?1049h\x1b[?25l")
+            self.load(self.root)
+            while self.running:
+                self.theme.reload()
+                self.drain_events()
+                self.render()
+                if select.select([self.fd], [], [], 0.25)[0]:
+                    key = read_key(self.fd)
+                    if key:
+                        self.handle(key)
+        finally:
+            self.write(RESET + "\x1b[?25h\x1b[?1049l")
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+
+    def write(self, s):
+        sys.stdout.write(s)
+        sys.stdout.flush()
+
+    def flash(self, text, color="foreground", sticky=False):
+        self.status = (text, color, time.monotonic(), sticky)
+
+    def drain_events(self):
+        while True:
+            try:
+                kind, value = self.events.get_nowait()
+            except queue.Empty:
+                return
+            if kind == "error":
+                self.flash(value, "red")
+            elif kind == "played":
+                self.refresh_meta(value)
+
+    # data
+
+    def fetch(self, node):
+        if node.kind == "root":
+            return self.plex.sections()
+        if node.kind == "section":
+            return self.plex.items(node.data["key"])
+        return self.plex.children(node.key)
+
+    def load(self, node, force=False):
+        if node.children is not None and not force:
+            return True
+        self.flash("loading…", "light_foreground", sticky=True)
+        self.render()
+        try:
+            items = self.fetch(node)
+        except PlexError as e:
+            self.flash(str(e), "red")
+            return False
+        existing = {c.key: c for c in node.children or []}
+        children = []
+        for data in items:
+            child = existing.get(data.get("ratingKey") or data.get("key"))
+            if child:
+                child.data = data
+            else:
+                child = Node(data, "section" if node.kind == "root" else data.get("type"), node)
+            children.append(child)
+        node.children = children
+        self.flash("" if children else "nothing here", "light_foreground")
+        return True
+
+    def reload(self, node):
+        if not self.load(node, force=True):
+            return False
+        for child in node.children:
+            if child.expanded:
+                self.reload(child)
+        return True
+
+    def refresh_meta(self, node):
+        try:
+            n = node
+            while n and n.kind not in ("root", "section"):
+                n.data = self.plex.metadata(n.key) or n.data
+                n = n.parent
+        except PlexError as e:
+            self.flash(str(e), "red")
+            return
+        if node.children is not None:
+            self.reload(node)
+
+    # navigation
+
+    def rows(self):
+        out, stack = [], list(reversed(self.root.children or []))
+        while stack:
+            n = stack.pop()
+            out.append(n)
+            if n.expanded and n.children:
+                stack.extend(reversed(n.children))
+        return out
+
+    def index(self, rows):
+        if not rows:
+            self.sel = None
+            return 0
+        pos = {id(r): i for i, r in enumerate(rows)}
+        n = self.sel
+        while n is not None and id(n) not in pos:
+            n = n.parent
+        self.sel = n if n is not None else rows[0]
+        return pos[id(self.sel)]
+
+    def handle(self, key):
+        if self.search is not None:
+            return self.handle_search(key)
+        rows = self.rows()
+        i = self.index(rows)
+        node = self.sel
+        half = max(1, self.body_height // 2)
+        moves = {
+            "j": i + 1, "down": i + 1, "k": i - 1, "up": i - 1,
+            "g": 0, "home": 0, "G": len(rows) - 1, "end": len(rows) - 1,
+            "ctrl-d": i + half, "pgdn": i + half, "ctrl-u": i - half, "pgup": i - half,
+        }
+        if key in ("q", "ctrl-c"):
+            self.running = False
+        elif key in moves and rows:
+            self.sel = rows[max(0, min(len(rows) - 1, moves[key]))]
+        elif node is None:
+            if key == "r":
+                self.load(self.root, force=True)
+        elif key in ("l", "right"):
+            if node.expanded and node.children:
+                self.sel = node.children[0]
+            elif not node.leaf and self.load(node):
+                node.expanded = True
+        elif key in ("h", "left"):
+            if node.expanded:
+                node.expanded = False
+            elif node.parent and node.parent.kind != "root":
+                self.sel = node.parent
+        elif key == "enter":
+            if node.leaf:
+                self.play(node, resume=True)
+            elif node.expanded:
+                node.expanded = False
+            elif self.load(node):
+                node.expanded = True
+        elif key == "p" and node.leaf:
+            self.play(node, resume=False)
+        elif key == "w" and node.kind not in ("root", "section"):
+            self.toggle_watched(node)
+        elif key == "r":
+            target = node if node.expanded else (node.parent or self.root)
+            if self.reload(target):
+                self.flash("reloaded", "light_foreground")
+        elif key == "/":
+            self.search, self.search_origin, self.revealed = "", node, []
+        elif key in ("n", "N"):
+            self.find(self.last_search, 1 if key == "n" else -1)
+            self.revealed = []
+
+    def handle_search(self, key):
+        if key in ("esc", "ctrl-c"):
+            self.collapse_revealed()
+            self.sel, self.search = self.search_origin, None
+        elif key == "enter":
+            self.last_search, self.search, self.revealed = self.search, None, []
+        elif key == "backspace":
+            self.search = self.search[:-1]
+            self.find(self.search, 0, self.search_origin)
+        elif len(key) == 1 and key.isprintable():
+            self.search += key
+            self.find(self.search, 0, self.search_origin)
+
+    def loaded(self):
+        out, stack = [], list(reversed(self.root.children or []))
+        while stack:
+            n = stack.pop()
+            out.append(n)
+            stack.extend(reversed(n.children or []))
+        return out
+
+    def find(self, query, step, start=None):
+        """Search every loaded node (not just visible rows) and reveal the match."""
+        nodes = self.loaded()
+        if not query or not nodes:
+            return
+        pos = {id(n): i for i, n in enumerate(nodes)}
+        origin = start or self.sel
+        i = pos.get(id(origin), 0)
+        offsets = range(len(nodes)) if step == 0 else range(1, len(nodes) + 1)
+        q = query.lower()
+        if self.search is not None:
+            self.collapse_revealed()
+        for k in offsets:
+            node = nodes[(i + (step or 1) * k) % len(nodes)]
+            if q in node.label().lower():
+                parent = node.parent
+                while parent and parent.kind != "root":
+                    if not parent.expanded:
+                        parent.expanded = True
+                        self.revealed.append(parent)
+                    parent = parent.parent
+                self.sel = node
+                return
+        self.flash(f"no match for “{query}”", "yellow")
+
+    def collapse_revealed(self):
+        for node in self.revealed:
+            node.expanded = False
+        self.revealed = []
+
+    # actions
+
+    def play(self, node, resume):
+        offset = node.data.get("viewOffset", 0) if resume else 0
+        if self.player and self.player.is_alive():
+            self.player.stop()
+        self.player = Player(self, node, offset)
+        self.player.start()
+        verb = f"resuming at {fmt_clock(offset)}" if offset else "playing"
+        self.flash(f"{verb}: {node.media_title()}", "accent")
+
+    def toggle_watched(self, node):
+        want = not node.watched()
+        try:
+            self.plex.scrobble(node.key, want)
+        except PlexError as e:
+            self.flash(str(e), "red")
+            return
+        self.refresh_meta(node)
+        self.flash("marked watched" if want else "marked unwatched", "green")
+
+    # drawing
+
+    def marker(self, node):
+        T = self.theme
+        if node.kind == "section":
+            return SECTION_ICONS.get(node.data.get("type"), "•"), T.fg("accent")
+        if node.in_progress():
+            return "◐", T.fg("accent")
+        if not node.watched():
+            return "●", T.fg("accent")
+        return " ", ""
+
+    def tree_row(self, node, width, selected):
+        T = self.theme
+        ln = Line(width, T.bg("selection") if selected else "")
+        ln.add("▎" if selected else " ", T.fg("accent"))
+        ln.add("  " * node.depth)
+        if node.leaf:
+            ln.add("  ")
+        else:
+            ln.add("▾ " if node.expanded else "▸ ", T.fg("light_foreground"))
+        mark, style = self.marker(node)
+        ln.add(mark + " ", style)
+        if selected:
+            label_style = T.fg("bright_foreground") + BOLD
+        elif node.leaf and node.watched():
+            label_style = T.fg("light_foreground")
+        else:
+            label_style = T.fg("foreground")
+        meta = node.meta()
+        room = width - ln.used - (wlen(meta) + 3 if meta else 1)
+        ln.add(trunc(node.label(), room), label_style)
+        if meta:
+            ln.right(meta + " ", T.fg("light_foreground"))
+        return str(ln)
+
+    def details(self, node, width):
+        T = self.theme
+        d = node.data
+        w = max(10, width - 3)
+        lines = [[]]
+        accent, bright, fg, dim = T.fg("accent") + BOLD, T.fg("bright_foreground") + BOLD, T.fg("foreground"), T.fg("light_foreground")
+
+        def para(text, style):
+            for chunk in textwrap.wrap(str(text), w) or [""]:
+                lines.append([(chunk, style)])
+
+        if node.kind == "section":
+            para(d.get("title", ""), bright)
+            para("movie library" if d.get("type") == "movie" else "tv library", dim)
+            if node.children is not None:
+                para(plural(len(node.children), "title"), dim)
+            return lines
+
+        if node.kind == "episode":
+            para(d.get("grandparentTitle", ""), accent)
+            para(f"S{d.get('parentIndex', 0):02d}E{d.get('index', 0):02d} · {d.get('title', '')}", bright)
+        elif node.kind == "season":
+            para(d.get("parentTitle", ""), accent)
+            para(d.get("title", ""), bright)
+        else:
+            para(d.get("title", ""), bright)
+
+        facts = []
+        if node.kind == "episode" and d.get("originallyAvailableAt"):
+            facts.append(d["originallyAvailableAt"])
+        elif d.get("year"):
+            facts.append(str(d["year"]))
+        if d.get("contentRating"):
+            facts.append(d["contentRating"])
+        if node.leaf and d.get("duration"):
+            facts.append(fmt_duration(d["duration"]))
+        if node.kind == "show" and d.get("childCount"):
+            facts.append(plural(d["childCount"], "season"))
+        if node.kind in ("show", "season") and d.get("leafCount"):
+            facts.append(plural(d["leafCount"], "episode"))
+        rating = d.get("audienceRating") or d.get("rating")
+        if rating:
+            facts.append(f"★ {rating:.1f}")
+        if facts:
+            para("  ·  ".join(facts), dim)
+
+        lines.append([])
+        if node.in_progress() and d.get("duration"):
+            bar = max(10, min(w - 16, 32))
+            filled = round(bar * d["viewOffset"] / d["duration"])
+            lines.append([
+                ("━" * filled, T.fg("accent")),
+                ("━" * (bar - filled), T.fg("dark_foreground")),
+                (f"  {fmt_clock(d['viewOffset'])} / {fmt_clock(d['duration'])}", dim),
+            ])
+        elif node.leaf:
+            lines.append([("✓ watched", T.fg("green"))] if node.watched() else [("● unwatched", T.fg("accent"))])
+        elif d.get("leafCount"):
+            seen, total = d.get("viewedLeafCount", 0), d["leafCount"]
+            style = T.fg("green") if seen >= total else T.fg("accent")
+            lines.append([(f"{seen}/{total} watched", style)])
+
+        if d.get("summary"):
+            lines.append([])
+            para(d["summary"], fg)
+
+        for field, title in (("Genre", "genre"), ("Director", "director"), ("Role", "cast")):
+            tags = [t.get("tag") for t in d.get(field) or [] if t.get("tag")]
+            if tags:
+                lines.append([])
+                lines.append([(title, T.fg("dark_foreground"))])
+                para(", ".join(tags[:6]), dim)
+
+        media = (d.get("Media") or [{}])[0]
+        tech = []
+        res = str(media.get("videoResolution") or "")
+        if res:
+            tech.append(res + "p" if res.isdigit() else res.upper())
+        for k in ("videoCodec", "audioCodec"):
+            if media.get(k):
+                tech.append(media[k])
+        if media.get("audioChannels"):
+            tech.append(f"{media['audioChannels']}ch")
+        if tech:
+            lines.append([])
+            para(" · ".join(tech), T.fg("dark_foreground"))
+        return lines
+
+    def current_status(self):
+        text, color, at, sticky = self.status
+        if text and (sticky or time.monotonic() - at < 4):
+            return text, color
+        if self.player and self.player.is_alive():
+            return f"▶ {self.player.title}", "accent"
+        return "", "foreground"
+
+    def render(self):
+        T = self.theme
+        w, h = shutil.get_terminal_size()
+        out = []
+        if self.resized:
+            out.append("\x1b[2J")
+            self.resized = False
+        if w < 40 or h < 8:
+            self.write("".join(out) + "\x1b[H" + RESET + trunc("plexi: terminal too small", w))
+            return
+
+        rows = self.rows()
+        cur = self.index(rows)
+        inner, body = w - 2, h - 3
+        self.body_height = body
+        dw = min(64, inner * 2 // 5) if inner >= 90 else 0
+        tw = inner - dw - (1 if dw else 0)
+
+        pad = min(3, body // 4)
+        if cur - pad < self.top:
+            self.top = cur - pad
+        elif cur + pad >= self.top + body:
+            self.top = cur + pad - body + 1
+        self.top = max(0, min(self.top, len(rows) - body))
+
+        frame, dim = T.fg("dark_foreground"), T.fg("light_foreground")
+        lines = []
+
+        top = Line(w).add("╭─", frame).add(" plexi ", T.fg("accent") + BOLD).add(self.server_name + " ", dim)
+        top.add("─" * max(0, w - top.used - 1), frame).add("╮", frame)
+        lines.append(str(top))
+
+        detail = self.details(self.sel, dw) if dw and self.sel else []
+        for y in range(body):
+            ln = Line(w).add("│", frame)
+            r = self.top + y
+            if r < len(rows):
+                ln.raw(self.tree_row(rows[r], tw, r == cur), tw)
+            else:
+                ln.add(" " * tw)
+            if dw:
+                ln.add("│", frame)
+                cell = Line(dw).add("  ")
+                for text, style in detail[y] if y < len(detail) else []:
+                    cell.add(text, style)
+                ln.raw(str(cell), dw)
+            ln.add("│", frame)
+            lines.append(str(ln))
+
+        msg, color = self.current_status()
+        bottom = Line(w).add("╰─", frame)
+        if rows:
+            bottom.add(f" {cur + 1}/{len(rows)} ", dim)
+        right = trunc(f" {msg} ", max(0, w - bottom.used - 2)) if msg else ""
+        bottom.add("─" * max(0, w - bottom.used - wlen(right) - 2), frame)
+        bottom.add(right, T.fg(color)).add("─╯", frame)
+        lines.append(str(bottom))
+
+        hints = Line(w).add(" ")
+        if self.search is not None:
+            hints.add("/", T.fg("accent") + BOLD).add(self.search, T.fg("bright_foreground")).add("▏", T.fg("accent"))
+            hints.right("enter keep · esc cancel ", dim)
+        else:
+            for key, label in HINTS:
+                hints.add(key, T.fg("accent")).add(f" {label}   ", dim)
+        lines.append(str(hints))
+
+        out.extend(f"\x1b[{i + 1};1H{line}" for i, line in enumerate(lines))
+        self.write("".join(out))
+
+
+# ── main ─────────────────────────────────────────────────────────────────
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE, end="")
+        return 0
+    if cmd in ("-V", "--version"):
+        print(f"plexi {VERSION}")
+        return 0
+    if cmd == "logout":
+        cfg = load_config()
+        save_config({"client_id": cfg["client_id"]} if cfg.get("client_id") else {})
+        print("signed out")
+        return 0
+    if cmd not in ("", "login"):
+        print(USAGE, end="", file=sys.stderr)
+        return 2
+
+    theme = Theme()
+    cfg = load_config()
+    url = os.environ.get("PLEX_URL") or cfg.get("server")
+    token = os.environ.get("PLEX_TOKEN") or cfg.get("token")
+
+    if cmd == "login" or not (url and token):
+        try:
+            cfg = login(theme)
+        except PlexError as e:
+            print(f"  {theme.fg('red')}✗ {e}{RESET}", file=sys.stderr)
+            return 1
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return 130
+        if cmd == "login":
+            return 0
+        url, token = cfg["server"], cfg["token"]
+
+    if not sys.stdin.isatty():
+        print("plexi needs an interactive terminal", file=sys.stderr)
+        return 1
+
+    if not cfg.get("client_id"):
+        cfg["client_id"] = str(uuid.uuid4())
+        save_config(cfg)
+
+    name = cfg.get("server_name") or urllib.parse.urlsplit(url).hostname or "plex"
+    App(Plex(url, token, cfg["client_id"]), name).run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

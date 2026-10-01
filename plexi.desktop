@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Name=Plexi
+GenericName=Plex Client
+Comment=Browse and play your Plex libraries from the keyboard
+Exec=xdg-terminal-exec --app-id=TUI.tile -e plexi
+TryExec=plexi
+Terminal=false
+Type=Application
+Icon=plexi
+Categories=AudioVideo;Video;Player;ConsoleOnly;
+Keywords=plex;movies;tv;shows;media;
+StartupNotify=true
