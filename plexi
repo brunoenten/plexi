@@ -53,7 +53,8 @@ usage:
 env:
   PLEX_URL, PLEX_TOKEN   override the saved server and token
   PLEXI_PASSTHROUGH=off  disable DTS/Dolby bitstreaming to an HDMI receiver
-                         (or set passthrough = "off" in config.toml)
+                         (or set passthrough = "off" in config.toml); a list
+                         such as "ac3,dts" limits it to those formats
   PLEXI_HDR=off          play HDR tone-mapped to SDR instead of switching
                          the display to HDR (or hdr = "off")
   PLEXI_REFRESH=off      don't match the display's refresh rate to the
@@ -652,13 +653,28 @@ SPDIF = {
 
 
 class Passthrough:
-    def __init__(self, device, sink, codecs, declared_now=False, busy=()):
+    def __init__(self, device, sink, codecs, declared_now=False, busy=(), channels=2):
         self.device, self.sink, self.codecs, self.declared_now = device, sink, codecs, declared_now
         # PipeWire only links a bitstream to an output nothing else is connected to
         self.busy = list(busy)
+        self.channels = channels
 
-    def labels(self):
-        return [SPDIF[c][3] for c in self.codecs]
+    def plan(self, media):
+        """(extra mpv args, description) for how a title's main audio track reaches the receiver."""
+        codec = stream_codec(media)
+        name = (media.get("audioCodec") or "audio").upper()
+        if self.busy:
+            return [], f"{name} decoded, {', '.join(self.busy)} holds"
+        args = ["--ao=pipewire", f"--audio-spdif={','.join(self.codecs)}"]
+        if codec in self.codecs:
+            return args, f"bitstream {SPDIF[codec][3]}"
+        if codec == "dts-hd" and "dts" in self.codecs:
+            return args, "bitstream DTS core"
+        channels = int(media.get("audioChannels") or 0)
+        # a stereo PCM output would downmix surround; a Dolby Digital bitstream keeps 5.1
+        if channels > 2 and self.channels <= 2 and "ac3" in self.codecs:
+            return args + ["--af=lavcac3enc"], f"{name} re-encoded to Dolby Digital"
+        return args, f"{name} decoded"
 
 
 def stream_codec(media):
@@ -717,12 +733,16 @@ def pipewire_default_sink():
                 "path": str(props.get("api.alsa.path", "")),
                 "iec958": declared,
                 "users": sorted(users),
+                "channels": int(props.get("audio.channels") or 2),
             }
     return None
 
 
-def detect_passthrough():
-    """Bitstream formats the default output's HDMI receiver accepts, declaring missing ones in PipeWire."""
+def detect_passthrough(only=None):
+    """Bitstream formats the default output's HDMI receiver accepts, declaring missing ones in PipeWire.
+
+    `only` limits them to a set of mpv --audio-spdif names, for links that advertise more than they carry.
+    """
     try:
         sink = pipewire_default_sink()
     except (OSError, subprocess.SubprocessError, ValueError) as e:
@@ -745,7 +765,7 @@ def detect_passthrough():
         log.debug("audio: no HDMI device reports ELD data on card %s; no passthrough", sink["card"])
         return None
     device, eld_codecs = next((r for r in receivers if r[0] and r[0] in sink["description"]), receivers[0])
-    supported = [c for c, spec in SPDIF.items() if spec[0] in eld_codecs]
+    supported = [c for c, spec in SPDIF.items() if spec[0] in eld_codecs and (only is None or c in only)]
     log.debug("audio: %s on %s advertises %s", device or "HDMI device", sink["name"], ", ".join(sorted(eld_codecs)) or "nothing")
     if not supported:
         return None
@@ -766,7 +786,7 @@ def detect_passthrough():
     codecs = [c for c in supported if SPDIF[c][1] in sink["iec958"]]
     if not codecs:
         return None
-    return Passthrough(device or sink["description"], sink["name"], codecs, declared_now, sink["users"])
+    return Passthrough(device or sink["description"], sink["name"], codecs, declared_now, sink["users"], sink["channels"])
 
 
 # ── video: HDR and refresh rate ──────────────────────────────────────────
@@ -976,8 +996,9 @@ class Player(threading.Thread):
             log.info("audio: %s is in use by %s; decoded instead of passthrough", audio.device, who)
             self.app.events.put(("info", f"{who} is using {audio.device} — playing decoded audio (close it for passthrough)"))
         elif audio:
-            cmd += ["--ao=pipewire", f"--audio-spdif={','.join(audio.codecs)}"]
-            log.info("audio: %s via %s, passthrough %s", audio.device, audio.sink, ",".join(audio.codecs))
+            args, route = audio.plan(media)
+            cmd += args
+            log.info("audio: %s → %s via %s (passthrough %s)", route, audio.device, audio.sink, ",".join(audio.codecs))
         else:
             log.info("audio: decoded (no passthrough)")
         cmd += ["--", url]
@@ -1086,6 +1107,8 @@ class App:
         self.error = None
         enabled = lambda env, key: str(os.environ.get(env) or cfg.get(key) or "auto").lower() != "off"
         self.passthrough = enabled("PLEXI_PASSTHROUGH", "passthrough")
+        mode = str(os.environ.get("PLEXI_PASSTHROUGH") or cfg.get("passthrough") or "auto").lower()
+        self.passthrough_only = None if mode in ("auto", "off") else {c.strip() for c in mode.split(",") if c.strip()}
         self.hdr = enabled("PLEXI_HDR", "hdr")
         self.match_refresh = enabled("PLEXI_REFRESH", "match_refresh")
         self.audio = None
@@ -1156,7 +1179,7 @@ class App:
         if not self.passthrough:
             self.audio = None
             return None
-        audio = detect_passthrough()
+        audio = detect_passthrough(self.passthrough_only)
         if audio and audio.declared_now:
             self.events.put(("info", f"enabled DTS/Dolby passthrough on {audio.device}"))
         summary = lambda a: (a.device, a.sink, tuple(a.codecs), tuple(a.busy)) if a else None
@@ -1703,15 +1726,7 @@ class App:
             lines.append([("video  ", T.fg("dark_foreground")), (" · ".join(video), dim)])
         audio = self.audio
         if node.leaf and audio:
-            codec = stream_codec(media)
-            if audio.busy:
-                route = f"{(media.get('audioCodec') or 'audio').upper()} decoded, {', '.join(audio.busy)} holds"
-            elif codec == "dts-hd" and codec not in audio.codecs and "dts" in audio.codecs:
-                route = "bitstream DTS core"
-            elif codec in audio.codecs:
-                route = f"bitstream {SPDIF[codec][3]}"
-            else:
-                route = f"{(media.get('audioCodec') or 'audio').upper()} decoded"
+            route = audio.plan(media)[1]
             lines.append([("audio  ", T.fg("dark_foreground")), (f"{route} → {audio.device}", dim)])
         return lines
 

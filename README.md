@@ -102,7 +102,11 @@ How it works:
 - PipeWire can only bitstream to an output that no other app is connected to. Browsers often keep a silent stream open, so if, say, Chromium holds the HDMI output, plexi plays decoded audio instead and tells you which app is in the way. The top border shows this too.
 - While bitstreaming, mpv's volume keys have no effect; use the receiver's volume.
 
+- When a surround track can't be bitstreamed and the HDMI output only takes stereo PCM (PipeWire's default HDMI profile), mpv re-encodes it to 5.1 Dolby Digital instead of downmixing it to stereo.
+
 To turn it off, set `passthrough = "off"` in `~/.config/plexi/config.toml`, or launch with `PLEXI_PASSTHROUGH=off plexi`.
+
+Some links advertise the receiver's formats but can't carry them, such as active DisplayPort-to-HDMI adapters, which often pass only 48 kHz bitstreams. List what actually works, for example `passthrough = "ac3,dts"`. The names are `ac3`, `eac3`, `truehd`, `dts` and `dts-hd`. Other surround tracks are then re-encoded to Dolby Digital, and DTS-HD plays as its DTS core.
 
 ## HDR and refresh rate
 
