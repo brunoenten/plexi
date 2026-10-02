@@ -54,6 +54,10 @@ env:
   PLEX_URL, PLEX_TOKEN   override the saved server and token
   PLEXI_PASSTHROUGH=off  disable DTS/Dolby bitstreaming to an HDMI receiver
                          (or set passthrough = "off" in config.toml)
+  PLEXI_HDR=off          play HDR tone-mapped to SDR instead of switching
+                         the display to HDR (or hdr = "off")
+  PLEXI_REFRESH=off      don't match the display's refresh rate to the
+                         video's frame rate (or match_refresh = "off")
 
 keys:
   j/k ↑/↓   move            l →   open / expand
@@ -564,7 +568,7 @@ CONTAINERS = ("root", "hub", "section")
 
 
 class Node:
-    __slots__ = ("data", "kind", "parent", "depth", "children", "expanded")
+    __slots__ = ("data", "kind", "parent", "depth", "children", "expanded", "detailed")
 
     def __init__(self, data, kind, parent):
         self.data = data
@@ -573,6 +577,7 @@ class Node:
         self.depth = parent.depth + 1 if parent else -1
         self.children = None
         self.expanded = False
+        self.detailed = False
 
     @property
     def key(self):
@@ -764,6 +769,105 @@ def detect_passthrough():
     return Passthrough(device or sink["description"], sink["name"], codecs, declared_now, sink["users"])
 
 
+# ── video: HDR and refresh rate ──────────────────────────────────────────
+
+# Plex's coarse videoFrameRate labels, for when the stream's exact rate isn't known
+FRAME_RATES = {"24p": 23.976, "ntsc": 29.97, "pal": 25.0, "50p": 50.0, "60p": 59.94}
+
+
+def video_stream(media):
+    """The video stream of a Plex media, {} if it has none, or None if streams weren't loaded."""
+    streams = (media.get("Part") or [{}])[0].get("Stream")
+    if streams is None:
+        return None
+    return next((s for s in streams if s.get("streamType") == 1), {})
+
+
+def video_info(media):
+    """(HDR kind or None, frames per second or None) for a Plex media."""
+    video = video_stream(media) or {}
+    trc = (video.get("colorTrc") or "").lower()
+    # Dolby Vision profile 5 has no HDR10 base layer and reports no transfer curve
+    if video.get("DOVIPresent"):
+        hdr = "Dolby Vision"
+    elif trc == "smpte2084":
+        hdr = "HDR10"
+    elif trc == "arib-std-b67":
+        hdr = "HLG"
+    else:
+        hdr = None
+    fps = video.get("frameRate")
+    if not isinstance(fps, (int, float)) or fps <= 0:
+        fps = FRAME_RATES.get(str(media.get("videoFrameRate") or "").lower())
+    return hdr, fps
+
+
+def fmt_fps(fps):
+    return f"{fps:.3f}".rstrip("0").rstrip(".")
+
+
+def true_rate(rate):
+    """Hyprland lists 23.976 Hz as 23.98, 59.94 as 59.94, etc.; recover the 1000/1001 rate."""
+    ntsc = round(rate) / 1.001
+    return ntsc if abs(rate - ntsc) < 0.006 else rate
+
+
+def pick_rate(rates, fps):
+    """The refresh rate that shows fps as an exact multiple (no judder), preferring the higher one; or None."""
+    best = None
+    for rate in rates:
+        actual = true_rate(rate)
+        k = round(actual / fps)
+        if k < 1:
+            continue
+        error = abs(actual / k - fps)
+        if error < 0.025 and (best is None or (round(error, 3), -rate) < best[0]):
+            best = ((round(error, 3), -rate), rate)
+    return best[1] if best else None
+
+
+class Display:
+    """A Hyprland monitor's mode, as reported by hyprctl and re-applied through hl.monitor()."""
+
+    def __init__(self, mon):
+        self.name = mon["name"]
+        self.width, self.height = mon["width"], mon["height"]
+        self.rate = mon["refreshRate"]
+        self.ten_bit = "2101010" in (mon.get("currentFormat") or "")
+        self.position = f"{mon['x']}x{mon['y']}"
+        self.scale = mon["scale"]
+        self.transform = mon.get("transform") or 0
+        prefix = f"{self.width}x{self.height}@"
+        self.rates = sorted({float(m[len(prefix):].rstrip("Hz")) for m in mon.get("availableModes") or [] if m.startswith(prefix)})
+
+    def mode(self, rate):
+        return f"{self.width}x{self.height}@{rate:.2f}"
+
+    def spec(self, rate, ten_bit):
+        return (
+            f'hl.monitor({{ output = "{self.name}", mode = "{self.mode(rate)}", position = "{self.position}", '
+            f"scale = {self.scale:g}, transform = {self.transform}, bitdepth = {10 if ten_bit else 8} }})"
+        )
+
+    def apply(self, rate, ten_bit):
+        out = subprocess.run(["hyprctl", "eval", self.spec(rate, ten_bit)], capture_output=True, text=True, timeout=5, check=True)
+        if out.stdout.strip() != "ok":
+            raise subprocess.SubprocessError(out.stdout.strip() or out.stderr.strip())
+
+
+def current_display():
+    """The focused Hyprland monitor, or None outside Hyprland."""
+    if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or not shutil.which("hyprctl"):
+        return None
+    try:
+        mons = json.loads(subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, timeout=3, check=True).stdout)
+        mon = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
+        return Display(mon) if mon else None
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
+        log.debug("display: can't query Hyprland (%s)", e)
+        return None
+
+
 # ── playback ─────────────────────────────────────────────────────────────
 
 
@@ -818,6 +922,7 @@ class Player(threading.Thread):
         cmd = [
             "mpv",
             "--force-window=immediate",
+            "--fs",
             f"--force-media-title={self.title}",
             f"--input-ipc-server={sock}",
             f"--start={self.offset / 1000:.3f}",
@@ -827,6 +932,31 @@ class Player(threading.Thread):
                 self.previous.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 pass
+
+        media = (item.get("Media") or [{}])[0]
+        if video_stream(media) is None:
+            try:
+                media = ((plex.metadata(item["ratingKey"]) or {}).get("Media") or [media])[0]
+            except PlexError:
+                pass
+        hdr, fps = video_info(media)
+        rate, switched = self.app.match_display(hdr if self.app.hdr else None, fps)
+        if switched:
+            # the HDMI link (and the receiver behind it) resyncs after a mode change
+            time.sleep(2)
+        if rate:
+            cmd.append("--video-sync=display-resample")
+        if hdr and self.app.hdr:
+            # Hyprland switches the output to HDR for a fullscreen window that asks for it,
+            # using the film's own mastering metadata
+            cmd += ["--vo=gpu-next", "--target-colorspace-hint=yes", "--target-colorspace-hint-mode=source"]
+        log.info(
+            "video: %s%s%s",
+            (hdr if self.app.hdr else f"{hdr} tone-mapped to SDR") if hdr else "SDR",
+            f" {fmt_fps(fps)} fps" if fps else "",
+            f", display {rate:g} Hz" if rate else ", display unchanged",
+        )
+
         audio = self.app.refresh_audio()
         if audio and audio.busy:
             who = ", ".join(audio.busy)
@@ -848,6 +978,7 @@ class Player(threading.Thread):
                 start_new_session=True,
             )
         except FileNotFoundError:
+            self.app.restore_display()
             self.app.events.put(("error", "mpv not found — install it with `omarchy pkg add mpv`"))
             return
 
@@ -870,6 +1001,8 @@ class Player(threading.Thread):
                     pass
 
         log.info("mpv exited with %s at %s", self.proc.returncode, fmt_clock(pos * 1000))
+        if self.app.player is self:
+            self.app.restore_display()
         if ipc:
             ipc.close()
         try:
@@ -935,10 +1068,15 @@ class App:
         self.server_name = cfg.get("server_name") or urllib.parse.urlsplit(plex.url).hostname or "plex"
         self.activity = None
         self.error = None
-        mode = os.environ.get("PLEXI_PASSTHROUGH") or cfg.get("passthrough") or "auto"
-        self.passthrough = str(mode).lower() != "off"
+        enabled = lambda env, key: str(os.environ.get(env) or cfg.get(key) or "auto").lower() != "off"
+        self.passthrough = enabled("PLEXI_PASSTHROUGH", "passthrough")
+        self.hdr = enabled("PLEXI_HDR", "hdr")
+        self.match_refresh = enabled("PLEXI_REFRESH", "match_refresh")
         self.audio = None
-        self.audio_checked = float("-inf")
+        self.display = None
+        self.display_saved = None
+        self.display_lock = threading.Lock()
+        self.devices_checked = float("-inf")
         self.theme = Theme()
         self.root = Node({}, "root", None)
         self.root.expanded = True
@@ -961,15 +1099,17 @@ class App:
     def run(self):
         saved = termios.tcgetattr(self.fd)
         signal.signal(signal.SIGWINCH, lambda *_: setattr(self, "resized", True))
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(sig, lambda *_: sys.exit(0))
         try:
             tty.setraw(self.fd)
             self.write("\x1b[?1049h\x1b[?25l")
             self.load(self.root)
             while self.running:
                 self.theme.reload()
-                if self.passthrough and time.monotonic() - self.audio_checked > 15:
-                    self.audio_checked = time.monotonic()
-                    threading.Thread(target=self.refresh_audio, daemon=True).start()
+                if time.monotonic() - self.devices_checked > 15:
+                    self.devices_checked = time.monotonic()
+                    threading.Thread(target=self.refresh_devices, daemon=True).start()
                 self.drain_events()
                 self.render()
                 if select.select([self.fd], [], [], 0.25)[0]:
@@ -980,8 +1120,13 @@ class App:
             log.exception("crashed")
             raise
         finally:
-            self.write(RESET + "\x1b[?25h\x1b[?1049l")
-            termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+            player = self.player
+            self.restore_display(after=player.proc if player and player.is_alive() else None)
+            try:
+                self.write(RESET + "\x1b[?25h\x1b[?1049l")
+                termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
+            except (OSError, termios.error):
+                pass
 
     def write(self, s):
         sys.stdout.write(s)
@@ -1008,6 +1153,65 @@ class App:
         self.audio = audio
         return audio
 
+    def refresh_devices(self):
+        if self.passthrough:
+            self.refresh_audio()
+        if self.hdr or self.match_refresh:
+            self.display = current_display()
+
+    def match_display(self, hdr, fps):
+        """Switch the display to fps's refresh rate (and 10-bit for HDR) before playback.
+
+        Returns (matched rate or None, whether the mode changed). Safe to call from any thread.
+        """
+        with self.display_lock:
+            current = current_display()
+            if not current:
+                return None, False
+            self.display = current
+            base = self.display_saved or current
+            rate = pick_rate(current.rates, fps) if self.match_refresh and fps else None
+            target_rate, ten_bit = rate or base.rate, bool(hdr) or base.ten_bit
+            if abs(target_rate - current.rate) < 0.005 and ten_bit == current.ten_bit:
+                return rate, False
+            try:
+                current.apply(target_rate, ten_bit)
+            except (OSError, subprocess.SubprocessError) as e:
+                log.warning("display: couldn't switch %s to %s (%s)", current.name, current.mode(target_rate), e)
+                return None, False
+            self.display_saved = base
+            depth = ", 10-bit" if ten_bit else ""
+            log.info("display: %s %s → %s%s", current.name, current.mode(current.rate), current.mode(target_rate), depth)
+            self.events.put(("info", f"{current.name} → {target_rate:g} Hz{depth}" + (f" for {hdr}" if hdr else "")))
+            return rate, True
+
+    def restore_display(self, after=None):
+        """Put the display back the way it was before playback; after mpv exits if `after` is still running."""
+        with self.display_lock:
+            saved, self.display_saved = self.display_saved, None
+            if not saved:
+                return
+            spec = saved.spec(saved.rate, saved.ten_bit)
+            if after and after.poll() is None:
+                # plexi is quitting while mpv keeps playing: restore once mpv is gone
+                subprocess.Popen(
+                    ["sh", "-c", 'while kill -0 "$1" 2>/dev/null; do sleep 1; done; exec hyprctl eval "$2"', "sh", str(after.pid), spec],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                )
+                log.info("display: %s will be restored to %s when mpv exits", saved.name, saved.mode(saved.rate))
+                return
+            try:
+                saved.apply(saved.rate, saved.ten_bit)
+                log.info("display: restored %s to %s", saved.name, saved.mode(saved.rate))
+            except (OSError, subprocess.SubprocessError) as e:
+                log.warning("display: couldn't restore %s (%s)", saved.name, e)
+
+    def fetch_details(self, node):
+        try:
+            self.events.put(("details", (node, self.plex.metadata(node.key))))
+        except PlexError as e:
+            log.debug("details for %s: %s", node.key, e)
+
     def fail(self, error, node=None):
         log.error("%s", error)
         self.flash(str(error), "red", ttl=10)
@@ -1024,6 +1228,9 @@ class App:
                 self.fail(value)
             elif kind == "info":
                 self.flash(value, "green", ttl=6)
+            elif kind == "details":
+                node, data = value
+                node.data = data or node.data
             elif kind == "played":
                 self.refresh_meta(value)
 
@@ -1460,6 +1667,21 @@ class App:
         if tech:
             lines.append([])
             para(" · ".join(tech), T.fg("dark_foreground"))
+        if node.leaf and video_stream(media) is None and not node.detailed:
+            node.detailed = True
+            threading.Thread(target=self.fetch_details, args=(node,), daemon=True).start()
+        hdr, fps = video_info(media) if node.leaf else (None, None)
+        if hdr or fps:
+            video = []
+            if hdr:
+                video.append(hdr if self.hdr else f"{hdr} tone-mapped to SDR")
+                if hdr == "Dolby Vision" and self.hdr:
+                    video[-1] += " as HDR10"
+            if fps:
+                display = self.display
+                rate = pick_rate(display.rates, fps) if display and self.match_refresh else None
+                video.append(f"{fmt_fps(fps)} fps" + (f" → {rate:g} Hz" if rate else ""))
+            lines.append([("video  ", T.fg("dark_foreground")), (" · ".join(video), dim)])
         audio = self.audio
         if node.leaf and audio:
             codec = stream_codec(media)

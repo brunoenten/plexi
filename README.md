@@ -25,6 +25,7 @@ Browse your libraries as a tree — **library → show → season → episode** 
 - Continue Watching (in progress and up next) and Recently Added across all libraries
 - Resumes where you left off and reports progress back to Plex (watched at 90%)
 - Detects an HDMI receiver and bitstreams Dolby (incl. TrueHD/Atmos) and DTS (incl. DTS-HD/DTS:X)
+- Switches the display to HDR for HDR titles, passing the film's metadata through, and matches the refresh rate to the frame rate
 - Unwatched `●` / in-progress `◐` markers, detail pane with summary and media info
 - Incremental search across everything you've loaded
 
@@ -102,6 +103,19 @@ How it works:
 - While bitstreaming, mpv's volume keys have no effect; use the receiver's volume.
 
 To turn it off, set `passthrough = "off"` in `~/.config/plexi/config.toml`, or launch with `PLEXI_PASSTHROUGH=off plexi`.
+
+## HDR and refresh rate
+
+mpv always opens fullscreen. For HDR10, HLG and Dolby Vision titles, plexi asks mpv to hand the video to the compositor in its own colorspace, with the film's mastering metadata (peak brightness, MaxCLL, MaxFALL). Hyprland's `render:cm_auto_hdr` (on by default) then switches the display to HDR while mpv is fullscreen, and back to SDR when you leave fullscreen or stop playback. The detail pane shows each title's HDR format and frame rate.
+
+On Hyprland, plexi also matches the display's refresh rate to the video so motion doesn't judder: 23.976 fps films play at 23.98 Hz, 25 fps at 50 Hz, 29.97 fps at 59.94 Hz, and so on. It picks the closest exact multiple your display offers at its current resolution, switches to 10-bit output for HDR titles, and puts everything back when mpv exits, even if you've quit plexi in the meantime. The screen (and an AV receiver in between) goes blank for a second or two while the mode changes.
+
+Notes:
+
+- Dolby Vision plays as HDR10 on displays without Dolby Vision support. mpv converts profile 5, which has no HDR10 base layer.
+- Outside Hyprland the display mode is left alone. Other compositors with color management (KDE Plasma, for example) still receive the HDR request.
+
+To turn either off, set `hdr = "off"` (HDR is tone-mapped to SDR) or `match_refresh = "off"` in `config.toml`, or launch with `PLEXI_HDR=off` / `PLEXI_REFRESH=off`.
 
 ## Troubleshooting
 
