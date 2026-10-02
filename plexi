@@ -58,7 +58,8 @@ env:
   PLEXI_HDR=off          play HDR tone-mapped to SDR instead of switching
                          the display to HDR (or hdr = "off")
   PLEXI_REFRESH=off      don't match the display's refresh rate to the
-                         video's frame rate (or match_refresh = "off")
+                         video's frame rate (or match_refresh = "off");
+                         "switch" always changes modes instead of using VRR
 
 keys:
   j/k ↑/↓   move            l →   open / expand
@@ -862,6 +863,14 @@ class Display:
         self.transform = mon.get("transform") or 0
         prefix = f"{self.width}x{self.height}@"
         self.rates = sorted({float(m[len(prefix):].rstrip("Hz")) for m in mon.get("availableModes") or [] if m.startswith(prefix)})
+        self.vrr_range = None
+
+    def vrr_covers(self, fps):
+        """Whether VRR can show fps (or a multiple of it) within the display's range at the current mode."""
+        if not self.vrr_range:
+            return False
+        low, high = self.vrr_range[0], min(self.vrr_range[1], self.rate + 0.5)
+        return any(low <= fps * k <= high for k in range(1, 9))
 
     def mode(self, rate):
         return f"{self.width}x{self.height}@{rate:.2f}"
@@ -878,14 +887,45 @@ class Display:
             raise subprocess.SubprocessError(out.stdout.strip() or out.stderr.strip())
 
 
+def edid_vrr_range(output):
+    """(min, max) Hz of the HDMI VRR range in a connector's EDID (HDMI Forum data block), or None."""
+    for path in glob.glob(f"/sys/class/drm/card*-{output}/edid"):
+        try:
+            with open(path, "rb") as f:
+                edid = f.read()
+        except OSError:
+            continue
+        for base in range(128, len(edid), 128):
+            block = edid[base:base + 128]
+            if len(block) < 4 or block[0] != 2:
+                continue
+            i = 4
+            while i < min(block[2], len(block)):
+                tag, length = block[i] >> 5, block[i] & 31
+                body = block[i + 1:i + 1 + length]
+                if tag == 3 and body[:3] == b"\xd8\x5d\xc4" and len(body) >= 10:
+                    low, high = body[8] & 0x3F, ((body[8] & 0xC0) << 2) | body[9]
+                    if low and high > low:
+                        return low, high
+                i += 1 + length
+    return None
+
+
 def current_display():
     """The focused Hyprland monitor, or None outside Hyprland."""
     if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or not shutil.which("hyprctl"):
         return None
     try:
-        mons = json.loads(subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, timeout=3, check=True).stdout)
+        run = lambda *cmd: json.loads(subprocess.run(["hyprctl", *cmd, "-j"], capture_output=True, timeout=3, check=True).stdout)
+        mons = run("monitors")
         mon = next((m for m in mons if m.get("focused")), mons[0] if mons else None)
-        return Display(mon) if mon else None
+        if not mon:
+            return None
+        display = Display(mon)
+        # any misc:vrr mode (always, fullscreen, fullscreen video) covers fullscreen mpv
+        if run("getoption", "misc:vrr").get("int"):
+            display.vrr_range = edid_vrr_range(display.name)
+        return display
     except (OSError, subprocess.SubprocessError, ValueError, KeyError) as e:
         log.debug("display: can't query Hyprland (%s)", e)
         return None
@@ -973,11 +1013,11 @@ class Player(threading.Thread):
             except PlexError:
                 pass
         hdr, fps = video_info(media)
-        rate, switched = self.app.match_display(hdr if self.app.hdr else None, fps)
+        sync, switched = self.app.match_display(hdr if self.app.hdr else None, fps)
         if switched:
             # the HDMI link (and the receiver behind it) resyncs after a mode change
             time.sleep(2)
-        if rate:
+        if isinstance(sync, float):
             cmd.append("--video-sync=display-resample")
         if hdr and self.app.hdr:
             # Hyprland switches the output to HDR for a fullscreen window that asks for it,
@@ -987,7 +1027,7 @@ class Player(threading.Thread):
             "video: %s%s%s",
             (hdr if self.app.hdr else f"{hdr} tone-mapped to SDR") if hdr else "SDR",
             f" {fmt_fps(fps)} fps" if fps else "",
-            f", display {rate:g} Hz" if rate else ", display unchanged",
+            ", display VRR" if sync == "vrr" else f", display {sync:g} Hz" if sync else ", display unchanged",
         )
 
         audio = self.app.refresh_audio()
@@ -1110,7 +1150,9 @@ class App:
         mode = str(os.environ.get("PLEXI_PASSTHROUGH") or cfg.get("passthrough") or "auto").lower()
         self.passthrough_only = None if mode in ("auto", "off") else {c.strip() for c in mode.split(",") if c.strip()}
         self.hdr = enabled("PLEXI_HDR", "hdr")
-        self.match_refresh = enabled("PLEXI_REFRESH", "match_refresh")
+        refresh = str(os.environ.get("PLEXI_REFRESH") or cfg.get("match_refresh") or "auto").lower()
+        self.match_refresh = refresh != "off"
+        self.prefer_vrr = refresh != "switch"
         self.audio = None
         self.display = None
         self.display_saved = None
@@ -1198,10 +1240,18 @@ class App:
         if self.hdr or self.match_refresh:
             self.display = current_display()
 
+    def refresh_for(self, display, fps):
+        """How fps will be shown on display: "vrr", a refresh rate to switch to, or None."""
+        if not (display and fps and self.match_refresh):
+            return None
+        if self.prefer_vrr and display.vrr_covers(fps):
+            return "vrr"
+        return pick_rate(display.rates, fps)
+
     def match_display(self, hdr, fps):
         """Switch the display to fps's refresh rate (and 10-bit for HDR) before playback.
 
-        Returns (matched rate or None, whether the mode changed). Safe to call from any thread.
+        Returns ("vrr", the matched rate or None; whether the mode changed). Safe to call from any thread.
         """
         with self.display_lock:
             current = current_display()
@@ -1209,10 +1259,11 @@ class App:
                 return None, False
             self.display = current
             base = self.display_saved or current
-            rate = pick_rate(current.rates, fps) if self.match_refresh and fps else None
+            sync = self.refresh_for(base, fps)
+            rate = sync if isinstance(sync, float) else None
             target_rate, ten_bit = rate or base.rate, bool(hdr) or base.ten_bit
             if abs(target_rate - current.rate) < 0.005 and ten_bit == current.ten_bit:
-                return rate, False
+                return sync, False
             try:
                 current.apply(target_rate, ten_bit)
             except (OSError, subprocess.SubprocessError) as e:
@@ -1222,7 +1273,7 @@ class App:
             depth = ", 10-bit" if ten_bit else ""
             log.info("display: %s %s → %s%s", current.name, current.mode(current.rate), current.mode(target_rate), depth)
             self.events.put(("info", f"{current.name} → {target_rate:g} Hz{depth}" + (f" for {hdr}" if hdr else "")))
-            return rate, True
+            return sync, True
 
     def restore_display(self, after=None):
         """Put the display back the way it was before playback; after mpv exits if `after` is still running."""
@@ -1720,9 +1771,8 @@ class App:
                 if hdr == "Dolby Vision" and self.hdr:
                     video[-1] += " as HDR10"
             if fps:
-                display = self.display
-                rate = pick_rate(display.rates, fps) if display and self.match_refresh else None
-                video.append(f"{fmt_fps(fps)} fps" + (f" → {rate:g} Hz" if rate else ""))
+                sync = self.refresh_for(self.display_saved or self.display, fps)
+                video.append(f"{fmt_fps(fps)} fps" + (" → VRR" if sync == "vrr" else f" → {sync:g} Hz" if sync else ""))
             lines.append([("video  ", T.fg("dark_foreground")), (" · ".join(video), dim)])
         audio = self.audio
         if node.leaf and audio:

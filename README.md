@@ -112,14 +112,18 @@ Some links advertise the receiver's formats but can't carry them, such as active
 
 mpv always opens fullscreen. For HDR10, HLG and Dolby Vision titles, plexi asks mpv to hand the video to the compositor in its own colorspace, with the film's mastering metadata (peak brightness, MaxCLL, MaxFALL). Hyprland's `render:cm_auto_hdr` (on by default) then switches the display to HDR while mpv is fullscreen, and back to SDR when you leave fullscreen or stop playback. The detail pane shows each title's HDR format and frame rate.
 
-On Hyprland, plexi also matches the display's refresh rate to the video so motion doesn't judder: 23.976 fps films play at 23.98 Hz, 25 fps at 50 Hz, 29.97 fps at 59.94 Hz, and so on. It picks the closest exact multiple your display offers at its current resolution, switches to 10-bit output for HDR titles, and puts everything back when mpv exits, even if you've quit plexi in the meantime. The screen (and an AV receiver in between) goes blank for a second or two while the mode changes.
+On Hyprland, plexi also makes sure the display shows every frame for the same time, so motion doesn't judder.
+
+If VRR is on (`misc:vrr`, for example `3` for fullscreen video and games only) and the display's VRR range covers the video's frame rate or a multiple of it, plexi leaves the mode alone and lets VRR follow the film. That means no blank screen, and even 24.000 fps films play at their exact rate. The range comes from the display's EDID. With a 48–120 Hz TV, run the desktop at 120 Hz: at 60 Hz, 23.976 fps doesn't fit, because doubling it gives 47.95 Hz, just under the minimum.
+
+Otherwise it switches the display's refresh rate to match the video: 23.976 fps films play at 23.98 Hz, 25 fps at 50 Hz, 29.97 fps at 59.94 Hz, and so on. It picks the closest exact multiple your display offers at its current resolution, switches to 10-bit output for HDR titles, and puts everything back when mpv exits, even if you've quit plexi in the meantime. The screen (and an AV receiver in between) goes blank for a second or two while the mode changes.
 
 Notes:
 
 - Dolby Vision plays as HDR10 on displays without Dolby Vision support. mpv converts profile 5, which has no HDR10 base layer.
 - Outside Hyprland the display mode is left alone. Other compositors with color management (KDE Plasma, for example) still receive the HDR request.
 
-To turn either off, set `hdr = "off"` (HDR is tone-mapped to SDR) or `match_refresh = "off"` in `config.toml`, or launch with `PLEXI_HDR=off` / `PLEXI_REFRESH=off`.
+To turn either off, set `hdr = "off"` (HDR is tone-mapped to SDR) or `match_refresh = "off"` in `config.toml`, or launch with `PLEXI_HDR=off` / `PLEXI_REFRESH=off`. `match_refresh = "switch"` always switches modes, even when VRR could be used.
 
 ## Troubleshooting
 
