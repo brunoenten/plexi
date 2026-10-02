@@ -24,6 +24,7 @@ Browse your libraries as a tree — **library → show → season → episode** 
 - Signs in through plex.tv in your browser, finds your server, prefers local connections
 - Continue Watching (in progress and up next) and Recently Added across all libraries
 - Resumes where you left off and reports progress back to Plex (watched at 90%)
+- Detects an HDMI receiver and bitstreams Dolby (incl. TrueHD/Atmos) and DTS (incl. DTS-HD/DTS:X)
 - Unwatched `●` / in-progress `◐` markers, detail pane with summary and media info
 - Incremental search across everything you've loaded
 
@@ -87,6 +88,20 @@ PLEX_URL=http://192.168.1.10:32400 PLEX_TOKEN=xxxx plexi
 ```
 
 Colors are read from `~/.local/state/omarchy/current/theme/colors.toml`. Outside Omarchy, plexi falls back to a neutral dark palette.
+
+## Surround sound passthrough
+
+When your default audio output is HDMI and the device on the other end (an AV receiver, soundbar or TV) advertises Dolby or DTS support, plexi sends those tracks to it untouched instead of decoding them: Dolby Digital, Dolby Digital+, TrueHD (including Atmos), DTS and DTS-HD (including DTS:X). The receiver's name appears in the top border, and the detail pane shows how each title's audio will be played.
+
+How it works:
+
+- The supported formats come from the HDMI device's ELD, which ALSA exposes in `/proc/asound/card*/eld#*`.
+- If the PipeWire HDMI output doesn't declare those formats yet (the default on a fresh install), plexi declares them once with `pactl set-sink-formats`. This is the same as ticking them under "Advanced" in pavucontrol, and WirePlumber remembers it.
+- Passthrough only applies when the HDMI output is the default output, so headphones and speakers keep working as usual. Detection runs again before each playback.
+- PipeWire can only bitstream to an output that no other app is connected to. Browsers often keep a silent stream open, so if, say, Chromium holds the HDMI output, plexi plays decoded audio instead and tells you which app is in the way. The top border shows this too.
+- While bitstreaming, mpv's volume keys have no effect; use the receiver's volume.
+
+To turn it off, set `passthrough = "off"` in `~/.config/plexi/config.toml`, or launch with `PLEXI_PASSTHROUGH=off plexi`.
 
 ## Troubleshooting
 

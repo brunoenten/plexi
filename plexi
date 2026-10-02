@@ -2,6 +2,7 @@
 """plexi — a lightweight, keyboard-driven Plex client that wears your Omarchy theme."""
 
 import concurrent.futures
+import glob
 import json
 import logging
 import logging.handlers
@@ -51,6 +52,8 @@ usage:
 
 env:
   PLEX_URL, PLEX_TOKEN   override the saved server and token
+  PLEXI_PASSTHROUGH=off  disable DTS/Dolby bitstreaming to an HDMI receiver
+                         (or set passthrough = "off" in config.toml)
 
 keys:
   j/k ↑/↓   move            l →   open / expand
@@ -631,6 +634,136 @@ class Node:
         return d.get("title", "")
 
 
+# ── audio passthrough ────────────────────────────────────────────────────
+
+# mpv --audio-spdif name → (ELD short-audio-descriptor name, PipeWire iec958 codec, PulseAudio format, label)
+SPDIF = {
+    "ac3": ("AC-3", "AC3", "ac3-iec61937", "Dolby Digital"),
+    "eac3": ("E-AC-3", "EAC3", "eac3-iec61937", "Dolby Digital+"),
+    "truehd": ("MLP", "TrueHD", "truehd-iec61937", "TrueHD"),
+    "dts": ("DTS", "DTS", "dts-iec61937", "DTS"),
+    "dts-hd": ("DTS-HD", "DTS-HD", "dtshd-iec61937", "DTS-HD"),
+}
+
+
+class Passthrough:
+    def __init__(self, device, sink, codecs, declared_now=False, busy=()):
+        self.device, self.sink, self.codecs, self.declared_now = device, sink, codecs, declared_now
+        # PipeWire only links a bitstream to an output nothing else is connected to
+        self.busy = list(busy)
+
+    def labels(self):
+        return [SPDIF[c][3] for c in self.codecs]
+
+
+def stream_codec(media):
+    """The mpv --audio-spdif name for a Plex media's primary audio codec, if it's a bitstream format."""
+    codec = (media.get("audioCodec") or "").lower()
+    if codec in ("dca", "dts", "dca-ma"):
+        return "dts-hd" if codec == "dca-ma" or (media.get("audioProfile") or "").lower() in ("ma", "hra") else "dts"
+    return codec if codec in SPDIF else None
+
+
+def parse_eld(text):
+    """Return (monitor_name, set of ELD codec names) for a connected HDMI sink, or None."""
+    fields = {}
+    for line in text.splitlines():
+        key, _, value = line.partition("\t")
+        fields[key.strip()] = value.strip()
+    if fields.get("monitor_present") != "1" or fields.get("eld_valid") != "1":
+        return None
+    codecs = set()
+    for key, value in fields.items():
+        if key.startswith("sad") and key.endswith("_coding_type"):
+            m = re.match(r"\[0x[0-9a-f]+\]\s*([^/(]+)", value)
+            if m:
+                codecs.add(m.group(1).strip())
+    return fields.get("monitor_name", ""), codecs
+
+
+def pipewire_default_sink():
+    """The default audio sink's name, description, ALSA card/path and declared iec958 codecs."""
+    objects = json.loads(subprocess.run(["pw-dump"], capture_output=True, timeout=3, check=True).stdout)
+    name = None
+    for obj in objects:
+        if obj.get("type") == "PipeWire:Interface:Metadata" and (obj.get("props") or {}).get("metadata.name") == "default":
+            for entry in obj.get("metadata") or []:
+                if entry.get("key") == "default.audio.sink":
+                    value = entry.get("value")
+                    name = (value if isinstance(value, dict) else json.loads(value or "{}")).get("name")
+    nodes = {obj["id"]: obj for obj in objects if obj.get("type") == "PipeWire:Interface:Node"}
+    for node_id, obj in nodes.items():
+        info = obj.get("info") or {}
+        props = info.get("props") or {}
+        if name and props.get("node.name") == name:
+            declared = []
+            for param in (info.get("params") or {}).get("Props") or []:
+                declared = param.get("iec958Codecs") or declared
+            users = set()
+            for link in objects:
+                link_info = link.get("info") or {}
+                if link.get("type") == "PipeWire:Interface:Link" and link_info.get("input-node-id") == node_id:
+                    peer = ((nodes.get(link_info.get("output-node-id")) or {}).get("info") or {}).get("props") or {}
+                    users.add(peer.get("application.name") or peer.get("node.description") or peer.get("node.name") or "another app")
+            return {
+                "name": name,
+                "description": props.get("node.description", ""),
+                "card": props.get("alsa.card"),
+                "path": str(props.get("api.alsa.path", "")),
+                "iec958": declared,
+                "users": sorted(users),
+            }
+    return None
+
+
+def detect_passthrough():
+    """Bitstream formats the default output's HDMI receiver accepts, declaring missing ones in PipeWire."""
+    try:
+        sink = pipewire_default_sink()
+    except (OSError, subprocess.SubprocessError, ValueError) as e:
+        log.debug("audio: can't query PipeWire (%s); no passthrough", e)
+        return None
+    if not sink or not sink["path"].startswith("hdmi") or sink["card"] is None:
+        log.debug("audio: default output %s isn't HDMI; no passthrough", sink["name"] if sink else "unknown")
+        return None
+
+    receivers = []
+    for path in sorted(glob.glob(f"/proc/asound/card{sink['card']}/eld#*")):
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                parsed = parse_eld(f.read())
+        except OSError:
+            continue
+        if parsed:
+            receivers.append(parsed)
+    if not receivers:
+        log.debug("audio: no HDMI device reports ELD data on card %s; no passthrough", sink["card"])
+        return None
+    device, eld_codecs = next((r for r in receivers if r[0] and r[0] in sink["description"]), receivers[0])
+    supported = [c for c, spec in SPDIF.items() if spec[0] in eld_codecs]
+    log.debug("audio: %s on %s advertises %s", device or "HDMI device", sink["name"], ", ".join(sorted(eld_codecs)) or "nothing")
+    if not supported:
+        return None
+
+    declared_now = False
+    if any(SPDIF[c][1] not in sink["iec958"] for c in supported):
+        formats = "; ".join(["pcm"] + [SPDIF[c][2] for c in supported])
+        try:
+            sinks = subprocess.run(["pactl", "list", "short", "sinks"], capture_output=True, text=True, timeout=3, check=True).stdout
+            index = next(line.split("\t")[0] for line in sinks.splitlines() if line.split("\t")[1:2] == [sink["name"]])
+            subprocess.run(["pactl", "set-sink-formats", index, formats], capture_output=True, timeout=3, check=True)
+            log.info("audio: declared passthrough formats on %s: %s", sink["name"], formats)
+            sink = pipewire_default_sink() or sink
+            declared_now = True
+        except (OSError, subprocess.SubprocessError, ValueError, StopIteration) as e:
+            log.warning("audio: couldn't declare passthrough formats on %s (%s)", sink["name"], e or "sink not found")
+
+    codecs = [c for c in supported if SPDIF[c][1] in sink["iec958"]]
+    if not codecs:
+        return None
+    return Passthrough(device or sink["description"], sink["name"], codecs, declared_now, sink["users"])
+
+
 # ── playback ─────────────────────────────────────────────────────────────
 
 
@@ -664,9 +797,9 @@ class MpvIPC:
 class Player(threading.Thread):
     """Runs mpv for one item and reports progress back to Plex."""
 
-    def __init__(self, app, node, offset_ms):
+    def __init__(self, app, node, offset_ms, previous=None):
         super().__init__(daemon=True)
-        self.app, self.node, self.offset = app, node, offset_ms
+        self.app, self.node, self.offset, self.previous = app, node, offset_ms, previous
         self.title = node.media_title()
         self.proc = None
 
@@ -688,9 +821,23 @@ class Player(threading.Thread):
             f"--force-media-title={self.title}",
             f"--input-ipc-server={sock}",
             f"--start={self.offset / 1000:.3f}",
-            "--",
-            url,
         ]
+        if self.previous and self.previous.proc:
+            try:
+                self.previous.proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+        audio = self.app.refresh_audio()
+        if audio and audio.busy:
+            who = ", ".join(audio.busy)
+            log.info("audio: %s is in use by %s; decoded instead of passthrough", audio.device, who)
+            self.app.events.put(("info", f"{who} is using {audio.device} — playing decoded audio (close it for passthrough)"))
+        elif audio:
+            cmd += ["--ao=pipewire", f"--audio-spdif={','.join(audio.codecs)}"]
+            log.info("audio: %s via %s, passthrough %s", audio.device, audio.sink, ",".join(audio.codecs))
+        else:
+            log.info("audio: decoded (no passthrough)")
+        cmd += ["--", url]
         log.info("mpv: %s (from %s)", redact(url), fmt_clock(self.offset))
         try:
             self.proc = subprocess.Popen(
@@ -788,6 +935,10 @@ class App:
         self.server_name = cfg.get("server_name") or urllib.parse.urlsplit(plex.url).hostname or "plex"
         self.activity = None
         self.error = None
+        mode = os.environ.get("PLEXI_PASSTHROUGH") or cfg.get("passthrough") or "auto"
+        self.passthrough = str(mode).lower() != "off"
+        self.audio = None
+        self.audio_checked = float("-inf")
         self.theme = Theme()
         self.root = Node({}, "root", None)
         self.root.expanded = True
@@ -816,6 +967,9 @@ class App:
             self.load(self.root)
             while self.running:
                 self.theme.reload()
+                if self.passthrough and time.monotonic() - self.audio_checked > 15:
+                    self.audio_checked = time.monotonic()
+                    threading.Thread(target=self.refresh_audio, daemon=True).start()
                 self.drain_events()
                 self.render()
                 if select.select([self.fd], [], [], 0.25)[0]:
@@ -836,6 +990,24 @@ class App:
     def flash(self, text, color="foreground", ttl=4):
         self.status = (text, color, time.monotonic(), ttl)
 
+    def refresh_audio(self):
+        """Detect HDMI passthrough for the current default output. Safe to call from any thread."""
+        if not self.passthrough:
+            self.audio = None
+            return None
+        audio = detect_passthrough()
+        if audio and audio.declared_now:
+            self.events.put(("info", f"enabled DTS/Dolby passthrough on {audio.device}"))
+        summary = lambda a: (a.device, a.sink, tuple(a.codecs), tuple(a.busy)) if a else None
+        if summary(audio) != summary(self.audio):
+            if audio:
+                busy = f", in use by {', '.join(audio.busy)}" if audio.busy else ""
+                log.info("audio: %s on %s supports passthrough of %s%s", audio.device, audio.sink, ",".join(audio.codecs), busy)
+            else:
+                log.info("audio: no passthrough-capable HDMI output")
+        self.audio = audio
+        return audio
+
     def fail(self, error, node=None):
         log.error("%s", error)
         self.flash(str(error), "red", ttl=10)
@@ -850,6 +1022,8 @@ class App:
                 return
             if kind == "error":
                 self.fail(value)
+            elif kind == "info":
+                self.flash(value, "green", ttl=6)
             elif kind == "played":
                 self.refresh_meta(value)
 
@@ -1136,9 +1310,10 @@ class App:
 
     def play(self, node, resume):
         offset = node.data.get("viewOffset", 0) if resume else 0
-        if self.player and self.player.is_alive():
-            self.player.stop()
-        self.player = Player(self, node, offset)
+        previous = self.player if self.player and self.player.is_alive() else None
+        if previous:
+            previous.stop()
+        self.player = Player(self, node, offset, previous)
         self.player.start()
         verb = f"resuming at {fmt_clock(offset)}" if offset else "playing"
         self.flash(f"{verb}: {node.media_title()}", "accent")
@@ -1285,6 +1460,18 @@ class App:
         if tech:
             lines.append([])
             para(" · ".join(tech), T.fg("dark_foreground"))
+        audio = self.audio
+        if node.leaf and audio:
+            codec = stream_codec(media)
+            if audio.busy:
+                route = f"{(media.get('audioCodec') or 'audio').upper()} decoded, {', '.join(audio.busy)} holds"
+            elif codec == "dts-hd" and codec not in audio.codecs and "dts" in audio.codecs:
+                route = "bitstream DTS core"
+            elif codec in audio.codecs:
+                route = f"bitstream {SPDIF[codec][3]}"
+            else:
+                route = f"{(media.get('audioCodec') or 'audio').upper()} decoded"
+            lines.append([("audio  ", T.fg("dark_foreground")), (f"{route} → {audio.device}", dim)])
         return lines
 
     def empty_panel(self):
@@ -1354,6 +1541,9 @@ class App:
         lines = []
 
         top = Line(w).add("╭─", frame).add(" plexi ", T.fg("accent") + BOLD).add(self.server_name + " ", dim)
+        if self.audio:
+            state = f"passthrough blocked by {', '.join(self.audio.busy)}" if self.audio.busy else "passthrough"
+            top.add("─ ", frame).add(f"{self.audio.device} · {state} ", T.fg("dark_foreground"))
         top.add("─" * max(0, w - top.used - 1), frame).add("╮", frame)
         lines.append(str(top))
 
