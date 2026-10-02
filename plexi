@@ -29,7 +29,7 @@ import urllib.request
 import uuid
 from http.client import HTTPException
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 PRODUCT = "plexi"
 
 XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
