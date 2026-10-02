@@ -816,6 +816,9 @@ def pick_rate(rates, fps):
     """The refresh rate that shows fps as an exact multiple (no judder), preferring the higher one; or None."""
     best = None
     for rate in rates:
+        # 100/120 Hz modes add nothing for video and push 4K 10-bit HDMI to its bandwidth limit
+        if rate > 61:
+            continue
         actual = true_rate(rate)
         k = round(actual / fps)
         if k < 1:
@@ -906,8 +909,18 @@ class Player(threading.Thread):
         self.app, self.node, self.offset, self.previous = app, node, offset_ms, previous
         self.title = node.media_title()
         self.proc = None
+        self.stopped = False
+        self.created = time.monotonic()
+
+    @property
+    def starting(self):
+        return self.is_alive() and self.proc is None and not self.stopped
+
+    def just_started(self, node):
+        return self.is_alive() and self.node is node and time.monotonic() - self.created < 5
 
     def stop(self):
+        self.stopped = True
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
 
@@ -968,6 +981,9 @@ class Player(threading.Thread):
         else:
             log.info("audio: decoded (no passthrough)")
         cmd += ["--", url]
+        if self.stopped:
+            log.info("superseded before mpv started: %s", self.title)
+            return
         log.info("mpv: %s (from %s)", redact(url), fmt_clock(self.offset))
         try:
             self.proc = subprocess.Popen(
@@ -1516,6 +1532,9 @@ class App:
     # actions
 
     def play(self, node, resume):
+        # a display mode change stalls the compositor, and a held enter key then auto-repeats
+        if self.player and (self.player.starting or self.player.just_started(node)):
+            return
         offset = node.data.get("viewOffset", 0) if resume else 0
         previous = self.player if self.player and self.player.is_alive() else None
         if previous:
