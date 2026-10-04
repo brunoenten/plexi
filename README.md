@@ -20,13 +20,14 @@ Browse your libraries as a tree — **library → show → season → episode** 
  j/k move   l open   h back   enter play   p from start   w watched   / find   r reload   q quit
 ```
 
-- Zero dependencies beyond Python 3.11+ and `mpv`
+- Python 3.11+ and `mpv`; optional ImageMagick for media artwork
 - Signs in through plex.tv in your browser, finds your server, prefers local connections
 - Continue Watching (in progress and up next) and Recently Added across all libraries
 - Resumes where you left off and reports progress back to Plex (watched at 90%)
 - Detects an HDMI receiver and bitstreams Dolby (incl. TrueHD/Atmos) and DTS (incl. DTS-HD/DTS:X)
 - Switches the display to HDR for HDR titles, passing the film's metadata through, and matches the refresh rate to the frame rate
 - Unwatched `●` / in-progress `◐` markers, detail pane with summary and media info
+- Movie/show posters and episode stills in the detail pane, loaded in the background and cached in memory
 - Incremental search across everything you've loaded
 
 ## Install
@@ -89,6 +90,14 @@ PLEX_URL=http://192.168.1.10:32400 PLEX_TOKEN=xxxx plexi
 ```
 
 Colors are read from `~/.local/state/omarchy/current/theme/colors.toml`. Outside Omarchy, plexi falls back to a neutral dark palette.
+
+## Media artwork
+
+With ImageMagick (`magick`) installed, selecting a movie, show, season, or episode displays its Plex artwork above the details. Episodes use their still image, with parent artwork as a fallback. Images load on a background worker, and a bounded memory cache avoids downloading them again while browsing. Missing artwork or ImageMagick leaves the text interface usable.
+
+Plexi detects sixel support (including Foot) at startup and uses the Kitty graphics protocol in Kitty and Ghostty. Other terminals, and terminal multiplexers, use a color block preview. The detail pane appears from 64 columns wide, and images appear from 13 rows tall. Select an individual movie, show, season, or episode to see its artwork; library headings and hubs have text details. A loading message appears while the preview downloads.
+
+Set `artwork = "auto"` in `~/.config/plexi/config.toml` or use `PLEXI_ARTWORK=auto`. Supported modes are `auto`, `sixel`, `kitty`, `blocks`, and `off`. Use `off` for the text interface. Artwork is requested only from the configured Plex server, using the existing authentication headers; no credentials are stored in image files.
 
 ## Surround sound passthrough
 
