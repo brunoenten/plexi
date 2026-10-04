@@ -2,6 +2,9 @@
 """plexi — a lightweight, keyboard-driven Plex client that wears your Omarchy theme."""
 
 import concurrent.futures
+import base64
+import collections
+import fcntl
 import glob
 import json
 import logging
@@ -14,6 +17,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import struct
 import sys
 import tempfile
 import termios
@@ -60,6 +64,8 @@ env:
   PLEXI_REFRESH=off      don't match the display's refresh rate to the
                          video's frame rate (or match_refresh = "off");
                          "switch" always changes modes instead of using VRR
+  PLEXI_ARTWORK=auto     media previews: auto, sixel, kitty, blocks, or off
+                         (or set artwork = "off" in config.toml)
 
 keys:
   j/k ↑/↓   move            l →   open / expand
@@ -641,6 +647,189 @@ class Node:
         return d.get("title", "")
 
 
+# ── media artwork ────────────────────────────────────────────────────────
+
+class Artwork:
+    """One background worker, bounded caches, and only the latest pending preview."""
+
+    def __init__(self, mode):
+        self.mode = mode if mode in ("auto", "sixel", "kitty", "blocks", "off") else "auto"
+        self.magick = shutil.which("magick")
+        self.condition = threading.Condition()
+        self.pending = None
+        self.active = None
+        self.closed = False
+        self.thread = None
+        self.originals = collections.OrderedDict()
+        self.previews = collections.OrderedDict()
+
+    def detect(self, fd, write, pending_input):
+        if self.mode != "auto" or not self.magick:
+            return
+        term = os.environ.get("TERM", "")
+        program = os.environ.get("TERM_PROGRAM", "").lower()
+        self.mode = "blocks"
+        if os.environ.get("TMUX") or term.startswith("screen"):
+            return
+        if term in ("xterm-kitty", "xterm-ghostty") or program in ("kitty", "ghostty"):
+            self.mode = "kitty"
+            return
+        # Primary device attributes advertise sixel with capability number 4.
+        write("\x1b[c")
+        response = bytearray()
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            if not select.select([fd], [], [], max(0, deadline - time.monotonic()))[0]:
+                break
+            response.extend(os.read(fd, 256))
+            match = re.search(rb"\x1b\[\?([0-9;]+)c", response)
+            if match:
+                if b"4" in match[1].split(b";"):
+                    self.mode = "sixel"
+                del response[match.start():match.end()]
+                break
+        # Preserve keys typed while the terminal answers the capability query.
+        pending_input.extend(response)
+
+    @staticmethod
+    def paths(node):
+        if node.kind in ("root", "hub", "section"):
+            return ()
+        paths = []
+        current = node
+        while current and current.kind not in ("root", "hub", "section"):
+            for field in ("thumb", "parentThumb", "grandparentThumb", "art"):
+                path = current.data.get(field)
+                # Requests must stay on the authenticated Plex server.
+                if isinstance(path, str) and path.startswith("/") and not path.startswith("//") and path not in paths:
+                    paths.append(path)
+            current = current.parent
+        return tuple(paths)
+
+    @staticmethod
+    def cells(fd):
+        try:
+            rows, cols, px, py = struct.unpack("HHHH", fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8))
+            if cols and rows and px and py:
+                return px / cols, py / rows
+        except (OSError, ValueError):
+            pass
+        return 8, 16
+
+    @staticmethod
+    def remember(cache, key, value, limit):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > limit:
+            cache.popitem(last=False)
+
+    def request(self, plex, paths, cols, rows, cell_size):
+        if self.closed or self.mode == "off" or not self.magick or not paths:
+            return None
+        source = (plex.url, plex.token, paths)
+        pixels = (max(1, round(cols * cell_size[0])), max(1, round(rows * cell_size[1])))
+        key = (source, cols, rows, pixels, self.mode)
+        with self.condition:
+            cached = self.previews.get(key)
+            if cached and (cached[1] is not None or time.monotonic() - cached[0] < 60):
+                self.previews.move_to_end(key)
+                # Cancel an obsolete pending job when returning to a cached title.
+                self.pending = None
+                return cached[1] or {"message": "artwork unavailable"}
+            if self.active != key:
+                self.pending = (key, plex)
+                self.condition.notify()
+            else:
+                self.pending = None
+            if self.thread is None:
+                self.thread = threading.Thread(target=self.work, daemon=True, name="plexi-artwork")
+                self.thread.start()
+        return {"message": "loading artwork…"}
+
+    def work(self):
+        while True:
+            with self.condition:
+                self.condition.wait_for(lambda: self.closed or self.pending is not None)
+                if self.closed:
+                    return
+                key, plex = self.pending
+                self.pending = None
+                self.active = key
+            result = None
+            try:
+                result = self.prepare(key, plex)
+            except (PlexError, OSError, ValueError, subprocess.SubprocessError) as error:
+                log.warning("artwork unavailable: %s", error)
+            with self.condition:
+                self.remember(self.previews, key, (time.monotonic(), result), 32)
+                self.active = None
+
+    def prepare(self, key, plex):
+        source, cols, rows, pixels, mode = key
+        body = self.originals.get(source)
+        if body is None:
+            for path in source[2]:
+                try:
+                    # Ask Plex for a small preview rather than decoding a full-size poster.
+                    url = plex._url("/photo/:/transcode", {
+                        "url": path, "width": 640, "height": 960, "minSize": 0, "upscale": 0,
+                    })
+                    req = urllib.request.Request(url, headers=plex.headers)
+                    with urllib.request.urlopen(req, timeout=5) as response:
+                        if not response.headers.get("Content-Type", "").startswith("image/"):
+                            continue
+                        body = response.read(8 * 1024 * 1024 + 1)
+                    if not body or len(body) > 8 * 1024 * 1024:
+                        body = None
+                        continue
+                    break
+                except (urllib.error.URLError, OSError, HTTPException):
+                    continue
+            if body is None:
+                return None
+            # Originals total at most 64 MiB; rendered previews are also bounded.
+            self.remember(self.originals, source, body, 8)
+        else:
+            self.originals.move_to_end(source)
+        pw, ph = (cols, rows * 2) if mode == "blocks" else pixels
+        command = [self.magick, "-limit", "memory", "64MiB", "-limit", "map", "128MiB",
+                   "-limit", "disk", "0", "-limit", "thread", "1", "-define", "jpeg:size=1024x1024",
+                   "-[0]", "-auto-orient",
+                   "-thumbnail", f"{pw}x{ph}", "-background", "#101010", "-alpha", "remove",
+                   "-alpha", "off", "-gravity", "center", "-extent", f"{pw}x{ph}", "-depth", "8"]
+        command += ["-colors", "256", "sixel:-"] if mode == "sixel" else ["rgb:-"]
+        converted = subprocess.run(command, input=body, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, timeout=8, check=True).stdout
+        if mode == "sixel":
+            return {"graphic": converted.decode("ascii"), "rows": rows, "cols": cols}
+        if len(converted) != pw * ph * 3:
+            raise ValueError("unexpected artwork dimensions")
+        if mode == "kitty":
+            payload = base64.b64encode(converted).decode("ascii")
+            chunks = []
+            for offset in range(0, len(payload), 4096):
+                first = f"a=T,f=24,s={pw},v={ph},i=7319,c={cols},r={rows},C=1,q=2,z=1," if offset == 0 else ""
+                more = int(offset + 4096 < len(payload))
+                chunks.append(f"\x1b_G{first}m={more};{payload[offset:offset + 4096]}\x1b\\")
+            return {"graphic": "".join(chunks), "rows": rows, "cols": cols}
+        rendered = []
+        for y in range(rows):
+            row = []
+            for x in range(cols):
+                a = ((y * 2) * cols + x) * 3
+                b = a + cols * 3
+                top, bottom = converted[a:a + 3], converted[b:b + 3]
+                row.append("\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm▀" % (*top, *bottom))
+            rendered.append("".join(row) + RESET)
+        return {"lines": rendered, "rows": rows, "cols": cols}
+
+    def close(self):
+        with self.condition:
+            self.closed = True
+            self.pending = None
+            self.condition.notify()
+
+
 # ── audio passthrough ────────────────────────────────────────────────────
 
 # mpv --audio-spdif name → (ELD short-audio-descriptor name, PipeWire iec958 codec, PulseAudio format, label)
@@ -1107,15 +1296,33 @@ ESCAPES = {
 CONTROLS = {3: "ctrl-c", 4: "ctrl-d", 21: "ctrl-u", 9: "tab"}
 
 
-def read_key(fd):
-    b = os.read(fd, 1)
+def read_key(fd, pending=None):
+    def read(count):
+        if pending:
+            value = bytes(pending[:count])
+            del pending[:count]
+            return value
+        return os.read(fd, count)
+
+    def ready(timeout):
+        return bool(pending) or bool(select.select([fd], [], [], timeout)[0])
+
+    b = read(1)
     if not b:
         return None
     c = b[0]
     if c == 0x1B:
-        if not select.select([fd], [], [], 0.03)[0]:
+        if not ready(0.03):
             return "esc"
-        return ESCAPES.get(os.read(fd, 8))
+        sequence = read(1)
+        if sequence in (b"[", b"O"):
+            while ready(0.03):
+                sequence += read(1)
+                if 0x40 <= sequence[-1] <= 0x7e:
+                    break
+                if len(sequence) > 128:
+                    return None
+        return ESCAPES.get(sequence)
     if c in (10, 13):
         return "enter"
     if c in (8, 127):
@@ -1124,7 +1331,8 @@ def read_key(fd):
         return CONTROLS.get(c)
     extra = 0 if c < 0x80 else 1 if c >> 5 == 0b110 else 2 if c >> 4 == 0b1110 else 3
     if extra:
-        b += os.read(fd, extra)
+        for _ in range(extra):
+            b += read(1)
     return b.decode("utf-8", "replace")
 
 
@@ -1174,6 +1382,9 @@ class App:
         self.resized = True
         self.body_height = 10
         self.fd = sys.stdin.fileno()
+        self.input_buffer = bytearray()
+        self.artwork = Artwork(str(os.environ.get("PLEXI_ARTWORK") or cfg.get("artwork") or "auto").lower())
+        self.last_frame = None
 
     # lifecycle
 
@@ -1185,6 +1396,7 @@ class App:
         try:
             tty.setraw(self.fd)
             self.write("\x1b[?1049h\x1b[?25l")
+            self.artwork.detect(self.fd, self.write, self.input_buffer)
             self.load(self.root)
             while self.running:
                 self.theme.reload()
@@ -1193,18 +1405,20 @@ class App:
                     threading.Thread(target=self.refresh_devices, daemon=True).start()
                 self.drain_events()
                 self.render()
-                if select.select([self.fd], [], [], 0.25)[0]:
-                    key = read_key(self.fd)
+                if self.input_buffer or select.select([self.fd], [], [], 0.25)[0]:
+                    key = read_key(self.fd, self.input_buffer)
                     if key:
                         self.handle(key)
         except Exception:
             log.exception("crashed")
             raise
         finally:
+            self.artwork.close()
+            graphics = "\x1b_Ga=d,d=I,i=7319,q=2;\x1b\\" if self.artwork.mode == "kitty" else ""
             player = self.player
             self.restore_display(after=player.proc if player and player.is_alive() else None)
             try:
-                self.write(RESET + "\x1b[?25h\x1b[?1049l")
+                self.write(graphics + RESET + "\x1b[?2026l\x1b[?25h\x1b[?1049l")
                 termios.tcsetattr(self.fd, termios.TCSADRAIN, saved)
             except (OSError, termios.error):
                 pass
@@ -1346,7 +1560,7 @@ class App:
         try:
             while worker.is_alive():
                 self.render()
-                if select.select([self.fd], [], [], 0.1)[0] and read_key(self.fd) in ("esc", "q", "ctrl-c"):
+                if (self.input_buffer or select.select([self.fd], [], [], 0.1)[0]) and read_key(self.fd, self.input_buffer) in ("esc", "q", "ctrl-c"):
                     log.info("cancelled: %s", self.activity[0])
                     raise Cancelled("cancelled")
         finally:
@@ -1826,14 +2040,16 @@ class App:
             out.append("\x1b[2J")
             self.resized = False
         if w < 40 or h < 8:
-            self.write("".join(out) + "\x1b[H" + RESET + trunc("plexi: terminal too small", w))
+            graphics = "\x1b_Ga=d,d=I,i=7319,q=2;\x1b\\" if self.artwork.mode == "kitty" else ""
+            self.last_frame = None
+            self.write(graphics + "".join(out) + "\x1b[H" + RESET + trunc("plexi: terminal too small", w))
             return
 
         rows = self.rows()
         cur = self.index(rows)
         inner, body = w - 2, h - 3
         self.body_height = body
-        dw = min(64, inner * 2 // 5) if inner >= 90 else 0
+        dw = min(64, max(26, inner * 2 // 5)) if inner >= 62 else 0
         tw = inner - dw - (1 if dw else 0)
 
         pad = min(3, body // 4)
@@ -1854,6 +2070,23 @@ class App:
         lines.append(str(top))
 
         detail = self.details(self.sel, dw) if dw and self.sel else []
+        preview = None
+        artwork_height = 0
+        artwork_left = 0
+        if dw and self.sel and body >= 10:
+            paths = self.artwork.paths(self.sel)
+            if paths:
+                cell_w, cell_h = self.artwork.cells(self.fd)
+                ratio = 16 / 9 if self.sel.kind == "episode" and self.sel.data.get("thumb") else 2 / 3
+                preview_rows = min(16, body // 2, body - 7, max(1, int((dw - 4) * cell_w / (cell_h * ratio))))
+                preview_cols = min(dw - 4, max(1, round(preview_rows * cell_h * ratio / cell_w)))
+                preview = self.artwork.request(self.plex, paths, preview_cols, preview_rows, (cell_w, cell_h))
+                if preview and "message" in preview:
+                    detail.insert(1, [(preview["message"], dim)])
+                    preview = None
+                if preview:
+                    artwork_height = preview["rows"] + 2
+                    artwork_left = (dw - preview["cols"]) // 2
         panel = [] if rows else self.empty_panel()
         for y in range(body):
             ln = Line(w).add("│", frame)
@@ -1869,14 +2102,23 @@ class App:
                 ln.add(" " * tw)
             if dw:
                 ln.add("│", frame)
-                cell = Line(dw).add("  ")
-                for text, style in detail[y] if y < len(detail) else []:
-                    cell.add(text, style)
+                cell = Line(dw)
+                if preview and 1 <= y <= preview["rows"]:
+                    cell.add(" " * artwork_left)
+                    if "lines" in preview:
+                        cell.raw(preview["lines"][y - 1], preview["cols"])
+                else:
+                    cell.add("  ")
+                    detail_y = y - artwork_height
+                    for text, style in detail[detail_y] if 0 <= detail_y < len(detail) else []:
+                        cell.add(text, style)
                 ln.raw(str(cell), dw)
             ln.add("│", frame)
             lines.append(str(ln))
 
         msg, color = self.current_status()
+        if not msg and not dw and self.sel and self.artwork.mode != "off" and self.artwork.paths(self.sel):
+            msg, color = "widen to 64 columns for artwork", "light_foreground"
         bottom = Line(w).add("╰─", frame)
         if rows:
             bottom.add(f" {cur + 1}/{len(rows)} ", dim)
@@ -1894,8 +2136,24 @@ class App:
                 hints.add(key, T.fg("accent")).add(f" {label}   ", dim)
         lines.append(str(hints))
 
-        out.extend(f"\x1b[{i + 1};1H{line}" for i, line in enumerate(lines))
-        self.write("".join(out))
+        graphic = preview.get("graphic", "") if preview else ""
+        frame_key = (tuple(lines), graphic, artwork_left)
+        if frame_key == self.last_frame and not out:
+            return
+        self.last_frame = frame_key
+        # Erasing the screen removes sixel previews when the selection changes.
+        # Synchronized updates keep the text and new artwork in one visible frame.
+        output = ["\x1b[?2026h"]
+        if self.artwork.mode == "kitty":
+            output.append("\x1b_Ga=d,d=I,i=7319,q=2;\x1b\\")
+        if self.artwork.mode == "sixel":
+            output.append("\x1b[2J")
+        output.extend(out)
+        output.extend(f"\x1b[{i + 1};1H{line}" for i, line in enumerate(lines))
+        if graphic:
+            output.append(f"\x1b[3;{tw + 3 + artwork_left}H" + graphic)
+        output.append("\x1b[?2026l")
+        self.write("".join(output))
 
 
 # ── main ─────────────────────────────────────────────────────────────────
