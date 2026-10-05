@@ -53,13 +53,6 @@ curl -LO https://github.com/brunoenten/plexi/releases/latest/download/PKGBUILD
 makepkg -si
 ```
 
-Anywhere else with Python 3.11+ and mpv, it's a single file:
-
-```sh
-curl -Lo ~/.local/bin/plexi https://raw.githubusercontent.com/brunoenten/plexi/main/plexi
-chmod +x ~/.local/bin/plexi
-```
-
 An AUR package is coming once AUR registrations reopen.
 
 ## Usage
