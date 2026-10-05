@@ -3,16 +3,37 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/brunoenten/plexi/main/install.sh | sh
 #
-# On Arch/Omarchy it installs the latest release package with pacman (mpv comes along).
-# Elsewhere it puts the single-file script in ~/.local/bin (or $PLEXI_BIN).
-# PLEXI_VERSION=0.4.0 pins a version.
+# On Arch/Omarchy it adds the bruno-omarchy-addons pacman repository and installs plexi from it,
+# so pacman -Syu keeps it up to date. Elsewhere it puts the single-file script in ~/.local/bin
+# (or $PLEXI_BIN). PLEXI_VERSION=0.4.0 pins a version (on Arch, the release's package).
 set -eu
 
 main() {
     repo=brunoenten/plexi
+    addons=bruno-omarchy-addons
+    key=16114DD8DBCA434D6F5EB1236F6D038C8A17FE15
     say() { printf '\033[1m%s\033[0m\n' "$*"; }
     die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
     command -v curl >/dev/null || die "curl is required"
+
+    if command -v pacman >/dev/null && [ -z "${PLEXI_BIN:-}" ] && [ -z "${PLEXI_VERSION:-}" ]; then
+        if ! grep -q "^\[$addons\]" /etc/pacman.conf; then
+            say "adding the $addons pacman repository (asks for your password)"
+            curl -fsSL "https://raw.githubusercontent.com/brunoenten/$addons/main/key.asc" | sudo pacman-key --add -
+            sudo pacman-key --lsign-key "$key"
+            printf '\n[%s]\nServer = https://github.com/brunoenten/%s/releases/download/repo\n' "$addons" "$addons" \
+                | sudo tee -a /etc/pacman.conf >/dev/null
+        fi
+        say "installing plexi with pacman (this also brings the system up to date)"
+        # When piped into sh, stdin is this script; pacman's questions need the keyboard.
+        if (exec </dev/tty) 2>/dev/null; then
+            sudo pacman -Syu --needed plexi </dev/tty
+        else
+            sudo pacman -Syu --needed --noconfirm plexi
+        fi
+        say "done — run plexi"
+        return
+    fi
 
     if [ -n "${PLEXI_VERSION:-}" ]; then
         tag="v${PLEXI_VERSION#v}"

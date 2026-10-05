@@ -35,11 +35,11 @@ Browse your libraries as a tree — **library → show → season → episode** 
 curl -fsSL https://raw.githubusercontent.com/brunoenten/plexi/main/install.sh | sh
 ```
 
-On Omarchy / Arch this installs the package from the [latest release](https://github.com/brunoenten/plexi/releases/latest) with pacman (it asks for your password). Elsewhere it puts the single file in `~/.local/bin` (it needs Python 3.11+ and mpv). Then launch **Plexi** from the app launcher (<kbd>Super</kbd> + <kbd>Space</kbd>), or run `plexi` in a terminal.
+On Omarchy / Arch this adds my [bruno-omarchy-addons](https://github.com/brunoenten/bruno-omarchy-addons) pacman repository and installs plexi from it, so `sudo pacman -Syu` keeps it up to date (it asks for your password). Elsewhere it puts the single file in `~/.local/bin` (it needs Python 3.11+ and mpv). Then launch **Plexi** from the app launcher (<kbd>Super</kbd> + <kbd>Space</kbd>), or run `plexi` in a terminal.
 
 plexi checks GitHub once a day for a new release and shows it in the top border; `plexi update` installs it. Turn the check off with `update_check = "off"` in the config or `PLEXI_UPDATE_CHECK=off`.
 
-Rather do it by hand? The package is on the release page:
+Rather do it by hand? Follow the [repository's setup](https://github.com/brunoenten/bruno-omarchy-addons#setup), then `sudo pacman -S plexi`. Or install a release's package directly:
 
 ```sh
 sudo pacman -U https://github.com/brunoenten/plexi/releases/download/v0.4.0/plexi-0.4.0-1-any.pkg.tar.zst
