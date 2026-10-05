@@ -36,6 +36,9 @@ XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"
 XDG_STATE = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
 CONFIG_PATH = os.path.join(XDG_CONFIG, "plexi", "config.toml")
 LOG_PATH = os.path.join(XDG_STATE, "plexi", "plexi.log")
+UPDATE_PATH = os.path.join(XDG_STATE, "plexi", "update.json")
+REPO = "brunoenten/plexi"
+INSTALL_URL = f"https://raw.githubusercontent.com/{REPO}/main/install.sh"
 THEME_PATHS = [
     os.path.join(XDG_STATE, "omarchy/current/theme/colors.toml"),
     os.path.join(XDG_CONFIG, "omarchy/current/theme/colors.toml"),
@@ -49,6 +52,7 @@ usage:
   plexi login     sign in again / pick another server
   plexi logout    forget the saved server and token
   plexi log       show the end of the log (requests, addresses tried, errors)
+  plexi update    install the latest release
 
 env:
   PLEX_URL, PLEX_TOKEN   override the saved server and token
@@ -57,6 +61,8 @@ env:
                          such as "ac3,dts" limits it to those formats
   PLEXI_HDR=off          play HDR tone-mapped to SDR instead of switching
                          the display to HDR (or hdr = "off")
+  PLEXI_UPDATE_CHECK=off don't check GitHub once a day for a new release
+                         (or update_check = "off")
   PLEXI_REFRESH=off      don't match the display's refresh rate to the
                          video's frame rate (or match_refresh = "off");
                          "switch" always changes modes instead of using VRR
@@ -554,6 +560,50 @@ def login(theme):
         raise ConnectionFailed(f"signed in, but none of {server['name']}'s addresses answered (see `plexi log`)")
     print(f"  {theme.fg('green')}✓{RESET} {fg}signed in to {server['name']} via {uri}{RESET}\n")
     return cfg
+
+
+# ── updates ──────────────────────────────────────────────────────────────
+
+
+def version_tuple(version):
+    return tuple(int(n) for n in re.findall(r"\d+", version)[:3])
+
+
+def latest_version(max_age=86400):
+    """The latest release on GitHub, asked at most once a day; None if unknown."""
+    try:
+        with open(UPDATE_PATH, encoding="utf-8") as f:
+            cached = json.load(f)
+        if time.time() - cached.get("checked", 0) < max_age:
+            return cached.get("latest")
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        release = http(f"https://api.github.com/repos/{REPO}/releases/latest", {"User-Agent": f"{PRODUCT}/{VERSION}"}, timeout=5)
+    except PlexError as e:
+        log.debug("update check: %s", e)
+        return None
+    latest = str(release.get("tag_name") or "").lstrip("v") or None
+    try:
+        os.makedirs(os.path.dirname(UPDATE_PATH), exist_ok=True)
+        with open(UPDATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"checked": time.time(), "latest": latest}, f)
+    except OSError:
+        pass
+    return latest
+
+
+def update():
+    """Run install.sh for the latest release: the pacman package if pacman owns this file, else replace this file."""
+    me = os.path.realpath(sys.argv[0])
+    if os.path.isdir(os.path.join(os.path.dirname(me), ".git")):
+        print(f"plexi runs from a git checkout ({os.path.dirname(me)}); update it with git pull", file=sys.stderr)
+        return 1
+    env = dict(os.environ)
+    owned = shutil.which("pacman") and subprocess.run(["pacman", "-Qo", me], capture_output=True).returncode == 0
+    if not owned:
+        env["PLEXI_BIN"] = me
+    return subprocess.run(["sh", "-c", f"curl -fsSL {INSTALL_URL} | sh"], env=env).returncode
 
 
 # ── tree ─────────────────────────────────────────────────────────────────
@@ -1158,6 +1208,8 @@ class App:
         self.display_saved = None
         self.display_lock = threading.Lock()
         self.devices_checked = float("-inf")
+        self.update_check = enabled("PLEXI_UPDATE_CHECK", "update_check")
+        self.update_available = None
         self.theme = Theme()
         self.root = Node({}, "root", None)
         self.root.expanded = True
@@ -1186,6 +1238,8 @@ class App:
             tty.setraw(self.fd)
             self.write("\x1b[?1049h\x1b[?25l")
             self.load(self.root)
+            if self.update_check:
+                threading.Thread(target=self.check_update, daemon=True).start()
             while self.running:
                 self.theme.reload()
                 if time.monotonic() - self.devices_checked > 15:
@@ -1233,6 +1287,13 @@ class App:
                 log.info("audio: no passthrough-capable HDMI output")
         self.audio = audio
         return audio
+
+    def check_update(self):
+        latest = latest_version()
+        if latest and version_tuple(latest) > version_tuple(VERSION):
+            log.info("plexi %s is available (running %s)", latest, VERSION)
+            self.update_available = latest
+            self.events.put(("info", f"plexi {latest} is available — quit and run `plexi update`"))
 
     def refresh_devices(self):
         if self.passthrough:
@@ -1850,6 +1911,8 @@ class App:
         if self.audio:
             state = f"passthrough blocked by {', '.join(self.audio.busy)}" if self.audio.busy else "passthrough"
             top.add("─ ", frame).add(f"{self.audio.device} · {state} ", T.fg("dark_foreground"))
+        if self.update_available:
+            top.add("─ ", frame).add(f"update {self.update_available} ", T.fg("green"))
         top.add("─" * max(0, w - top.used - 1), frame).add("╮", frame)
         lines.append(str(top))
 
@@ -1922,6 +1985,8 @@ def main(argv):
         except OSError:
             print("(no log yet)")
         return 0
+    if cmd == "update":
+        return update()
     if cmd not in ("", "login"):
         print(USAGE, end="", file=sys.stderr)
         return 2

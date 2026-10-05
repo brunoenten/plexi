@@ -31,15 +31,21 @@ Browse your libraries as a tree — **library → show → season → episode** 
 
 ## Install
 
-On Omarchy / Arch, install the package from the [latest release](https://github.com/brunoenten/plexi/releases/latest):
+```sh
+curl -fsSL https://raw.githubusercontent.com/brunoenten/plexi/main/install.sh | sh
+```
+
+On Omarchy / Arch this installs the package from the [latest release](https://github.com/brunoenten/plexi/releases/latest) with pacman (it asks for your password). Elsewhere it puts the single file in `~/.local/bin` (it needs Python 3.11+ and mpv). Then launch **Plexi** from the app launcher (<kbd>Super</kbd> + <kbd>Space</kbd>), or run `plexi` in a terminal.
+
+plexi checks GitHub once a day for a new release and shows it in the top border; `plexi update` installs it. Turn the check off with `update_check = "off"` in the config or `PLEXI_UPDATE_CHECK=off`.
+
+Rather do it by hand? The package is on the release page:
 
 ```sh
 sudo pacman -U https://github.com/brunoenten/plexi/releases/download/v0.4.0/plexi-0.4.0-1-any.pkg.tar.zst
 ```
 
-Then launch **Plexi** from the app launcher (<kbd>Super</kbd> + <kbd>Space</kbd>), or run `plexi` in a terminal.
-
-Prefer building it yourself? Each release also ships its `PKGBUILD`:
+Each release also ships its `PKGBUILD`:
 
 ```sh
 mkdir plexi && cd plexi
@@ -63,6 +69,7 @@ plexi           browse your libraries (signs in on first run)
 plexi login     sign in again / pick another server
 plexi logout    forget the saved server and token
 plexi log       show the end of the log
+plexi update    install the latest release
 ```
 
 | Key | Action |
